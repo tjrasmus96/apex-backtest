@@ -1,0 +1,47 @@
+name: APEX Live Trading Bot
+
+on:
+  schedule:
+    - cron: '*/15 12-22 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  trade:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install MetaTrader5 requests
+
+      - name: Download previous bot state
+        uses: actions/download-artifact@v4
+        with:
+          name: bot-state
+          path: .
+        continue-on-error: true
+
+      - name: Run Live Trading Bot
+        env:
+          MT5_LOGIN:         ${{ secrets.MT5_LOGIN }}
+          MT5_PASSWORD:      ${{ secrets.MT5_PASSWORD }}
+          MT5_SERVER:        ${{ secrets.MT5_SERVER }}
+          MT5_ACCOUNT_SIZE:  ${{ secrets.MT5_ACCOUNT_SIZE }}
+          SUPABASE_URL:      ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY:      ${{ secrets.SUPABASE_KEY }}
+        run: python live_trading_bot.py
+
+      - name: Save bot state
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bot-state
+          path: bot_state.json
+          if-no-files-found: ignore
+          overwrite: true
