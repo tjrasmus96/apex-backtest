@@ -1,60 +1,48 @@
 """
-APEX BACKTEST v7 — CROSS-SECTIONAL MOMENTUM + WALK-FORWARD VALIDATION
-======================================================================
-HYPOTHESIS:
-  Crypto assets that have outperformed their peers over the past N hours
-  continue to outperform over the next M hours (momentum effect).
-  We go long the top-ranked assets and avoid (or short) the bottom-ranked.
-  This is market-structure based, not indicator-based.
+APEX BACKTEST v8 — EUR/USD MEAN REVERSION (FTMO-OPTIMISED)
+===========================================================
+STRATEGY: Mean reversion on EUR/USD during London/NY session overlap
+MARKET:   Forex (EUR/USD) — lower volatility, tighter spreads than crypto
+TIMEFRAME: 1-hour bars
+SESSION:  08:00–17:00 EST (London/NY overlap = highest liquidity)
 
-WHY THIS IS DIFFERENT FROM PREVIOUS VERSIONS:
-  - Not relying on RSI/BB/EMA combinations (over-fitted before)
-  - Based on RELATIVE performance across assets, not absolute price levels
-  - Partially market-neutral: if all crypto dumps, we're in the top assets,
-    not just "everything is long"
-  - Documented in academic literature for equities AND crypto
+WHY THIS FITS FTMO RULES PERFECTLY:
+  - No time limit means we can be patient — 0.15%/day target over 70 days
+  - 5% daily loss limit = our bot hard-stops at 3.5% (big safety buffer)
+  - 10% max drawdown = our bot hard-stops at 7% (big safety buffer)
+  - Mean reversion in ranging forex = consistent small wins, not big swings
+  - London/NY overlap = tightest spreads, most liquid, most ranging behaviour
 
-HONEST METHODOLOGY — WALK-FORWARD VALIDATION:
-  Phase 1 — IN-SAMPLE  (months 1-4): Parameter optimisation
-  Phase 2 — OUT-OF-SAMPLE (months 5-6): Blind validation
+WALK-FORWARD METHODOLOGY (honest):
+  In-sample:     months 1-4 (parameter optimisation)
+  Out-of-sample: months 5-6 (blind validation — never touched during optimisation)
+  ONLY proceed to live trading if OOS Sharpe > 0.5 AND OOS return > 0%
+
+FTMO RISK RULES HARD-CODED:
+  Max daily loss:  3.5% (FTMO limit is 5% — we use 3.5% for safety buffer)
+  Max total loss:  7.0% (FTMO limit is 10% — we use 7% for safety buffer)
+  Min trading days: 4 per phase (we target 1 trade per day minimum)
   
-  If it only works in-sample: the edge isn't real.
-  If it holds out-of-sample: we might have something.
-  This is the only honest way to test.
-
 PARAMETERS TESTED:
-  lookback  : how many hours to measure momentum (12, 24, 48, 72, 96)
-  hold_hrs  : how long to hold each position (4, 8, 12, 24)
-  top_n     : how many assets to hold at once (1, 2, 3)
-  skip_hrs  : skip most recent N hours to avoid reversal (0, 4, 8)
+  bb_period : Bollinger Band period (10, 15, 20, 25)
+  bb_std    : Standard deviation multiplier (1.5, 2.0, 2.5)
+  rsi_period: RSI period (7, 14, 21)
+  rsi_ob    : RSI overbought level (65, 70, 75)
+  rsi_os    : RSI oversold level (25, 30, 35)
+  atr_stop  : Stop loss ATR multiplier (1.0, 1.5, 2.0)
+  atr_tp    : Take profit ATR multiplier (1.5, 2.0, 2.5, 3.0)
 
-POSITION SIZING:
-  Equal weight across top_n positions
-  Max 20% of equity per position
-  Stop loss: 3x ATR (wider — momentum needs room to breathe)
-  No take profit: hold for hold_hrs then rebalance
-
-SECONDARY STRATEGY — FUNDING RATE PROXY:
-  Uses price momentum as a proxy for crowded positioning
-  Extreme recent momentum (>8% in 24hrs) = likely crowded = fade signal
-  Tested separately to isolate its contribution
+DATA SOURCE: Yahoo Finance EUR/USD hourly
 """
 
 import json, math, urllib.request, os, itertools
 from datetime import datetime, timezone
 
-# ─────────────────────────────────────────────────────────────────────────────
-# DATA
-# ─────────────────────────────────────────────────────────────────────────────
+# ── DATA ─────────────────────────────────────────────────────────────────────
 
-def fetch_historical(symbol, months=6):
-    yf_map = {
-        "BTC/USD":"BTC-USD","ETH/USD":"ETH-USD","SOL/USD":"SOL-USD",
-        "AVAX/USD":"AVAX-USD","LINK/USD":"LINK-USD","BCH/USD":"BCH-USD",
-        "LTC/USD":"LTC-USD","AAVE/USD":"AAVE-USD",
-    }
-    yf_sym = yf_map.get(symbol, symbol.replace("/","-"))
-    url = (f"https://query1.finance.yahoo.com/v8/finance/chart/{yf_sym}"
+def fetch_eurusd(months=6):
+    """Fetch EUR/USD hourly data from Yahoo Finance"""
+    url = (f"https://query1.finance.yahoo.com/v8/finance/chart/EURUSD=X"
            f"?interval=1h&range={months*30}d")
     try:
         req = urllib.request.Request(url, headers={"User-Agent":"Mozilla/5.0"})
@@ -66,435 +54,491 @@ def fetch_historical(symbol, months=6):
         bars = []
         for i, ts in enumerate(timestamps):
             c = ohlcv["close"][i]
-            if c is None: continue
+            if c is None or c == 0: continue
             bars.append({
                 "timestamp": ts,
+                "open":   ohlcv["open"][i]  or c,
+                "high":   ohlcv["high"][i]  or c,
+                "low":    ohlcv["low"][i]   or c,
                 "close":  c,
-                "high":   ohlcv["high"][i]   or c,
-                "low":    ohlcv["low"][i]    or c,
                 "volume": ohlcv["volume"][i] or 0,
+                # Hour of day in EST (UTC-5, approximate)
+                "hour_est": ((ts % 86400) // 3600 - 5) % 24,
             })
-        return bars
+        # Filter to trading hours only (08:00-17:00 EST)
+        session = [b for b in bars if 8 <= b["hour_est"] <= 17]
+        print(f"  EUR/USD: {len(bars)} total bars, "
+              f"{len(session)} session bars (08-17 EST)")
+        return bars, session
     except Exception as e:
-        print(f"  {symbol}: failed — {e}")
-        return []
+        print(f"  EUR/USD fetch failed: {e}")
+        return [], []
 
-# ─────────────────────────────────────────────────────────────────────────────
-# INDICATORS
-# ─────────────────────────────────────────────────────────────────────────────
+# ── INDICATORS ────────────────────────────────────────────────────────────────
+
+def calc_bb(closes, period, std_mult):
+    if len(closes) < period:
+        c = closes[-1]
+        return c*(1+0.001*std_mult), c, c*(1-0.001*std_mult)
+    sl  = closes[-period:]
+    mid = sum(sl) / period
+    std = math.sqrt(sum((x-mid)**2 for x in sl) / period)
+    return mid + std_mult*std, mid, mid - std_mult*std
+
+def calc_rsi(closes, period):
+    if len(closes) < period + 1: return 50.0
+    gains  = [max(closes[i]-closes[i-1], 0) for i in range(1, len(closes))]
+    losses = [max(closes[i-1]-closes[i], 0) for i in range(1, len(closes))]
+    ag = sum(gains[-period:])  / period
+    al = sum(losses[-period:]) / period
+    if al == 0: return 100.0
+    return 100 - 100 / (1 + ag/al)
 
 def calc_atr(closes, period=14):
-    if len(closes) < 2: return closes[-1] * 0.02
+    if len(closes) < 2: return abs(closes[-1]) * 0.001
     trs = [abs(closes[i]-closes[i-1]) for i in range(1, len(closes))]
     return sum(trs[-period:]) / min(len(trs), period)
 
-def momentum_return(closes, lookback, skip=0):
-    """
-    Return over [lookback] hours, skipping most recent [skip] hours.
-    Skipping recent bars avoids short-term reversal contamination.
-    """
-    if len(closes) < lookback + skip + 1:
-        return 0.0
-    end   = len(closes) - 1 - skip
-    start = end - lookback
-    if start < 0: return 0.0
-    if closes[start] <= 0: return 0.0
-    return (closes[end] - closes[start]) / closes[start]
+def calc_zscore(closes, period=20):
+    if len(closes) < period: return 0.0
+    sl  = closes[-period:]
+    mid = sum(sl) / period
+    std = math.sqrt(sum((x-mid)**2 for x in sl) / period) or 1e-10
+    return (closes[-1] - mid) / std
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CROSS-SECTIONAL MOMENTUM BACKTEST
-# ─────────────────────────────────────────────────────────────────────────────
+# ── CORE BACKTEST ─────────────────────────────────────────────────────────────
 
-def run_cs_momentum(all_bars, symbols, start_bar, end_bar,
-                    lookback, hold_hrs, top_n, skip_hrs,
-                    starting_cash=100000, stop_atr_mult=3.0):
+def run_backtest(bars, start_idx, end_idx, params,
+                 starting_cash=50000,
+                 max_daily_loss_pct=0.035,   # 3.5% (FTMO=5%, we use 3.5%)
+                 max_total_loss_pct=0.07):    # 7.0% (FTMO=10%, we use 7%)
     """
-    Core engine. Runs cross-sectional momentum over a bar range.
-    Returns results dict.
+    Run EUR/USD mean reversion backtest on session bars.
+    Only trades during session hours (already filtered in data).
+    Hard-coded FTMO risk limits.
     """
-    cash       = starting_cash
-    positions  = {}   # sym -> {qty, entry, entry_bar, value}
-    trades     = []
-    equity_curve = [cash]
-    peak       = cash
-    max_dd     = 0
+    bb_period  = params["bb_period"]
+    bb_std     = params["bb_std"]
+    rsi_period = params["rsi_period"]
+    rsi_ob     = params["rsi_ob"]
+    rsi_os     = params["rsi_os"]
+    atr_stop   = params["atr_stop"]
+    atr_tp     = params["atr_tp"]
 
-    rebalance_every = hold_hrs  # rebalance every hold_hrs bars
+    cash          = starting_cash
+    position      = None   # {side, entry, stop, tp, size, bar_idx}
+    trades        = []
+    equity_curve  = [cash]
+    peak          = cash
+    max_dd        = 0
+    trading_days  = set()
+    daily_pnl     = {}
+    killed        = False   # Hard stop triggered
 
-    for i in range(max(lookback + skip_hrs + 1, 100), end_bar):
-        if i < start_bar:
+    for i in range(max(bb_period, rsi_period, 30), end_idx):
+        if i < start_idx:
+            equity_curve.append(cash)
+            continue
+        if killed:
             equity_curve.append(cash)
             continue
 
-        # ── Equity snapshot ──
-        total = cash
-        for sym, pos in positions.items():
-            bars = all_bars.get(sym, [])
-            if i < len(bars):
-                total += pos["qty"] * bars[i]["close"]
-        equity_curve.append(total)
-        if total > peak: peak = total
-        dd = (peak - total) / peak * 100
+        bar    = bars[i]
+        cur    = bar["close"]
+        ts     = bar["timestamp"]
+        day    = ts // 86400
+
+        # Track equity
+        equity = cash
+        if position:
+            pnl_open = (cur - position["entry"]) * position["size"]
+            if position["side"] == "SELL":
+                pnl_open = -pnl_open
+            equity = cash + pnl_open
+        equity_curve.append(equity)
+        if equity > peak: peak = equity
+        dd = (peak - equity) / peak * 100
         if dd > max_dd: max_dd = dd
 
-        # ── Manage exits ──
-        for sym in list(positions.keys()):
-            bars = all_bars.get(sym, [])
-            if i >= len(bars): continue
-            pos    = positions[sym]
-            cur    = bars[i]["close"]
-            closes = [b["close"] for b in bars[:i+1]]
-            atr    = calc_atr(closes)
-            held   = i - pos["entry_bar"]
+        # FTMO total loss check
+        total_loss_pct = (starting_cash - equity) / starting_cash
+        if total_loss_pct >= max_total_loss_pct:
+            # Close position if open, then stop trading
+            if position:
+                pnl = (cur - position["entry"]) * position["size"]
+                if position["side"] == "SELL": pnl = -pnl
+                cash += pnl
+                trades.append({**position, "exit": cur, "pnl": pnl,
+                               "exit_reason": "Total DD limit hit",
+                               "bars_held": i - position["bar_idx"]})
+                position = None
+            killed = True
+            continue
 
-            # Stop loss
-            if cur < pos["entry"] - atr * stop_atr_mult:
-                profit = (cur - pos["entry"]) * pos["qty"]
-                cash  += cur * pos["qty"]
-                trades.append({"symbol":sym,"entry":pos["entry"],"exit":cur,
-                    "profit":profit,"bars_held":held,"reason":"Stop loss"})
-                del positions[sym]
-                continue
+        # FTMO daily loss check
+        day_pnl = daily_pnl.get(day, 0)
+        max_daily_loss = starting_cash * max_daily_loss_pct
+        if day_pnl <= -max_daily_loss:
+            if position:
+                pnl = (cur - position["entry"]) * position["size"]
+                if position["side"] == "SELL": pnl = -pnl
+                cash += pnl
+                daily_pnl[day] = daily_pnl.get(day, 0) + pnl
+                trades.append({**position, "exit": cur, "pnl": pnl,
+                               "exit_reason": "Daily loss limit hit",
+                               "bars_held": i - position["bar_idx"]})
+                position = None
+            continue
 
-            # Time exit: held for hold_hrs bars
-            if held >= hold_hrs:
-                profit = (cur - pos["entry"]) * pos["qty"]
-                cash  += cur * pos["qty"]
-                trades.append({"symbol":sym,"entry":pos["entry"],"exit":cur,
-                    "profit":profit,"bars_held":held,"reason":"Time exit"})
-                del positions[sym]
+        closes = [b["close"] for b in bars[max(0,i-100):i+1]]
+        atr    = calc_atr(closes)
 
-        # ── Rebalance: rank and enter top N ──
-        if i % rebalance_every == 0:
-            # Close any remaining positions on rebalance
-            for sym in list(positions.keys()):
-                bars = all_bars.get(sym, [])
-                if i >= len(bars): continue
-                pos  = positions[sym]
-                cur  = bars[i]["close"]
-                held = i - pos["entry_bar"]
-                profit = (cur - pos["entry"]) * pos["qty"]
-                cash  += cur * pos["qty"]
-                trades.append({"symbol":sym,"entry":pos["entry"],"exit":cur,
-                    "profit":profit,"bars_held":held,"reason":"Rebalance"})
-            positions = {}
+        # ── Manage open position ──
+        if position:
+            pnl = (cur - position["entry"]) * position["size"]
+            if position["side"] == "SELL": pnl = -pnl
 
-            # Rank all symbols by momentum
-            scores = {}
-            for sym in symbols:
-                bars = all_bars.get(sym, [])
-                if i >= len(bars): continue
-                closes = [b["close"] for b in bars[:i+1]]
-                scores[sym] = momentum_return(closes, lookback, skip_hrs)
+            hit_stop = (position["side"] == "BUY"  and cur <= position["stop"]) or \
+                       (position["side"] == "SELL" and cur >= position["stop"])
+            hit_tp   = (position["side"] == "BUY"  and cur >= position["tp"]) or \
+                       (position["side"] == "SELL" and cur <= position["tp"])
 
-            if not scores: continue
+            if hit_stop or hit_tp:
+                cash += position["size"] * position["entry"] + pnl
+                daily_pnl[day] = daily_pnl.get(day, 0) + pnl
+                trades.append({**position, "exit": cur, "pnl": pnl,
+                               "exit_reason": "TP" if hit_tp else "Stop",
+                               "bars_held": i - position["bar_idx"]})
+                trading_days.add(day)
+                position = None
+            continue
 
-            # Sort: best momentum first
-            ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        # ── Signal generation ──
+        upper, mid, lower = calc_bb(closes, bb_period, bb_std)
+        rsi = calc_rsi(closes, rsi_period)
+        z   = calc_zscore(closes, bb_period)
 
-            # Enter top_n positions
-            n_to_enter = min(top_n, len(ranked))
-            # Only enter if momentum is positive (don't buy falling assets)
-            candidates = [(s, sc) for s, sc in ranked[:n_to_enter] if sc > 0]
+        # Position sizing: risk 0.5% of account per trade
+        # (conservative — FTMO rewards consistency over aggression)
+        risk_per_trade = cash * 0.005
+        stop_distance  = atr * atr_stop
+        if stop_distance <= 0: continue
+        # In forex, size = units of base currency
+        # For simplicity, size = risk_dollars / stop_distance
+        size = risk_per_trade / stop_distance
 
-            if not candidates: continue
+        # BUY signal: price below lower BB + RSI oversold + z-score negative
+        if (cur < lower and rsi < rsi_os and z < -1.5):
+            stop = cur - atr * atr_stop
+            tp   = cur + atr * atr_tp
+            position = {
+                "side": "BUY", "entry": cur,
+                "stop": stop, "tp": tp,
+                "size": size, "bar_idx": i,
+                "entry_ts": ts,
+            }
+            cash -= size * cur  # simplified: reserve cost basis
 
-            alloc_per = total / len(candidates)
-            alloc_per = min(alloc_per, total * 0.20)  # max 20% each
+        # SELL signal: price above upper BB + RSI overbought + z-score positive
+        elif (cur > upper and rsi > rsi_ob and z > 1.5):
+            stop = cur + atr * atr_stop
+            tp   = cur - atr * atr_tp
+            position = {
+                "side": "SELL", "entry": cur,
+                "stop": stop, "tp": tp,
+                "size": size, "bar_idx": i,
+                "entry_ts": ts,
+            }
+            cash -= size * cur  # simplified: reserve
 
-            for sym, score in candidates:
-                if cash < 10: break
-                bars = all_bars.get(sym, [])
-                if i >= len(bars): continue
-                cur   = bars[i]["close"]
-                spend = min(alloc_per, cash * 0.95)
-                if spend < 10: continue
-                qty   = spend / cur
-                cash -= spend
-                positions[sym] = {
-                    "qty": qty, "entry": cur,
-                    "entry_bar": i, "value": spend,
-                    "score": score,
-                }
+    # Close any open position at end
+    if position and bars:
+        cur = bars[min(end_idx-1, len(bars)-1)]["close"]
+        pnl = (cur - position["entry"]) * position["size"]
+        if position["side"] == "SELL": pnl = -pnl
+        cash += position["size"] * position["entry"] + pnl
+        trades.append({**position, "exit": cur, "pnl": pnl,
+                       "exit_reason": "End", "bars_held": end_idx - position["bar_idx"]})
 
-    # Close all remaining
-    for sym, pos in list(positions.items()):
-        bars = all_bars.get(sym, [])
-        if not bars: continue
-        cur    = bars[min(end_bar-1, len(bars)-1)]["close"]
-        profit = (cur - pos["entry"]) * pos["qty"]
-        cash  += cur * pos["qty"]
-        trades.append({"symbol":sym,"entry":pos["entry"],"exit":cur,
-            "profit":profit,"bars_held":end_bar-pos["entry_bar"],
-            "reason":"End"})
+    # Results
+    final  = cash
+    ret    = (final - starting_cash) / starting_cash * 100
+    wins   = [t for t in trades if t["pnl"] > 0]
+    losses = [t for t in trades if t["pnl"] <= 0]
+    wr     = len(wins)/len(trades)*100 if trades else 0
+    pf     = (sum(t["pnl"] for t in wins) /
+              abs(sum(t["pnl"] for t in losses))
+              if wins and losses else 0)
+    avg_win  = sum(t["pnl"] for t in wins)/len(wins)     if wins   else 0
+    avg_loss = abs(sum(t["pnl"] for t in losses)/len(losses)) if losses else 0
 
-    final   = cash
-    ret     = (final - starting_cash) / starting_cash * 100
-    wins    = [t for t in trades if t["profit"] > 0]
-    losses  = [t for t in trades if t["profit"] <= 0]
-    wr      = len(wins)/len(trades)*100 if trades else 0
-    pf      = (sum(t["profit"] for t in wins) /
-               abs(sum(t["profit"] for t in losses))
-               if wins and losses else 0)
-    avg_win  = sum(t["profit"] for t in wins)/len(wins)     if wins   else 0
-    avg_loss = abs(sum(t["profit"] for t in losses)/len(losses)) if losses else 0
-
-    # Sharpe
+    # Sharpe (hourly, annualised)
+    sharpe = 0
     if len(equity_curve) > 1:
         rets  = [(equity_curve[i]-equity_curve[i-1])/equity_curve[i-1]
-                 for i in range(1,len(equity_curve)) if equity_curve[i-1]>0]
-        avg_r = sum(rets)/len(rets) if rets else 0
-        std_r = math.sqrt(sum((r-avg_r)**2 for r in rets)/len(rets)) if rets else 1
-        sharpe = avg_r/std_r*math.sqrt(24*365) if std_r > 0 else 0
-    else:
-        sharpe = 0
+                 for i in range(1, len(equity_curve)) if equity_curve[i-1] > 0]
+        if rets:
+            avg_r = sum(rets)/len(rets)
+            std_r = math.sqrt(sum((r-avg_r)**2 for r in rets)/len(rets))
+            sharpe = avg_r/std_r*math.sqrt(24*252) if std_r > 0 else 0
+
+    # FTMO-specific metrics
+    daily_returns = {}
+    for t in trades:
+        d = t["entry_ts"] // 86400
+        daily_returns[d] = daily_returns.get(d, 0) + t["pnl"]
+    worst_day_pct = min(
+        (v/starting_cash*100 for v in daily_returns.values()),
+        default=0
+    )
+    ftmo_daily_ok = worst_day_pct > -5.0
+    ftmo_total_ok = max_dd < 10.0
+    ftmo_target   = ret >= 10.0
+    ftmo_pass     = ftmo_daily_ok and ftmo_total_ok and ftmo_target
 
     return {
-        "return_pct":     round(ret, 3),
-        "final":          round(final, 2),
-        "profit":         round(final - starting_cash, 2),
-        "trades":         len(trades),
-        "win_rate":       round(wr, 1),
-        "profit_factor":  round(pf, 3),
-        "avg_win":        round(avg_win, 2),
-        "avg_loss":       round(avg_loss, 2),
-        "max_dd":         round(max_dd, 2),
-        "sharpe":         round(sharpe, 3),
-        "equity_curve":   [round(e,2) for e in equity_curve[::20]],
+        "return_pct":    round(ret, 3),
+        "final":         round(final, 2),
+        "profit":        round(final - starting_cash, 2),
+        "trades":        len(trades),
+        "win_rate":      round(wr, 1),
+        "profit_factor": round(pf, 3),
+        "avg_win":       round(avg_win, 4),
+        "avg_loss":      round(avg_loss, 4),
+        "max_dd":        round(max_dd, 3),
+        "sharpe":        round(sharpe, 3),
+        "worst_day_pct": round(worst_day_pct, 3),
+        "trading_days":  len(trading_days),
+        "killed":        killed,
+        "ftmo_daily_ok": ftmo_daily_ok,
+        "ftmo_total_ok": ftmo_total_ok,
+        "ftmo_target":   ftmo_target,
+        "ftmo_pass":     ftmo_pass,
+        "equity_curve":  [round(e,2) for e in equity_curve[::10]],
     }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PARAMETER OPTIMISATION (in-sample only)
-# ─────────────────────────────────────────────────────────────────────────────
+# ── OPTIMISATION ──────────────────────────────────────────────────────────────
 
-def optimise(all_bars, symbols, is_start, is_end):
-    """
-    Grid search over parameters on IN-SAMPLE data only.
-    Returns best parameter set by Sharpe (not return — avoids overfit to return).
-    """
-    lookbacks  = [12, 24, 48, 72, 96]
-    hold_hrss  = [4, 8, 12, 24]
-    top_ns     = [1, 2, 3]
-    skip_hrss  = [0, 4, 8]
+def optimise(bars, start_idx, end_idx):
+    param_grid = {
+        "bb_period":  [10, 15, 20, 25],
+        "bb_std":     [1.5, 2.0, 2.5],
+        "rsi_period": [7, 14, 21],
+        "rsi_ob":     [65, 70, 75],
+        "rsi_os":     [25, 30, 35],
+        "atr_stop":   [1.0, 1.5, 2.0],
+        "atr_tp":     [1.5, 2.0, 2.5, 3.0],
+    }
+
+    keys   = list(param_grid.keys())
+    values = list(param_grid.values())
+    combos = list(itertools.product(*values))
+    print(f"  Testing {len(combos)} parameter combinations in-sample...")
 
     results = []
-    total_combos = len(lookbacks)*len(hold_hrss)*len(top_ns)*len(skip_hrss)
-    print(f"  Testing {total_combos} parameter combinations in-sample...")
+    for combo in combos:
+        params = dict(zip(keys, combo))
+        r = run_backtest(bars, start_idx, end_idx, params)
+        # Only keep results with enough trades to be meaningful
+        if r["trades"] >= 10:
+            results.append({**params, **r})
 
-    for lookback, hold_hrs, top_n, skip_hrs in itertools.product(
-            lookbacks, hold_hrss, top_ns, skip_hrss):
-        r = run_cs_momentum(
-            all_bars, symbols, is_start, is_end,
-            lookback=lookback, hold_hrs=hold_hrs,
-            top_n=top_n, skip_hrs=skip_hrs,
-        )
-        results.append({
-            "lookback": lookback, "hold_hrs": hold_hrs,
-            "top_n": top_n, "skip_hrs": skip_hrs,
-            **r
-        })
+    if not results:
+        print("  No valid combinations found (too few trades)")
+        return None, []
 
-    # Sort by Sharpe (most robust metric — penalises volatile returns)
+    # Sort by Sharpe — most robust metric
     results.sort(key=lambda x: x["sharpe"], reverse=True)
 
-    print(f"\n  Top 5 in-sample parameter sets (by Sharpe):")
-    print(f"  {'LB':>4} {'Hold':>5} {'TopN':>5} {'Skip':>5} "
-          f"{'Ret%':>7} {'WR%':>6} {'PF':>6} {'Sharpe':>8} {'DD%':>6}")
-    print(f"  {'-'*60}")
+    print(f"\n  Top 5 in-sample results (by Sharpe):")
+    print(f"  {'BBp':>4}{'BBs':>5}{'RSIp':>5}{'OB':>4}{'OS':>4}"
+          f"{'Stp':>5}{'TP':>5}{'Ret%':>7}{'WR%':>6}"
+          f"{'PF':>6}{'Sharpe':>8}{'DD%':>6}{'Trd':>5}")
+    print(f"  {'-'*75}")
     for r in results[:5]:
-        print(f"  {r['lookback']:>4} {r['hold_hrs']:>5} {r['top_n']:>5} "
-              f"{r['skip_hrs']:>5} {r['return_pct']:>7.2f} "
-              f"{r['win_rate']:>6.1f} {r['profit_factor']:>6.3f} "
-              f"{r['sharpe']:>8.3f} {r['max_dd']:>6.2f}")
+        print(f"  {r['bb_period']:>4}{r['bb_std']:>5}"
+              f"{r['rsi_period']:>5}{r['rsi_ob']:>4}{r['rsi_os']:>4}"
+              f"{r['atr_stop']:>5}{r['atr_tp']:>5}"
+              f"{r['return_pct']:>7.2f}{r['win_rate']:>6.1f}"
+              f"{r['profit_factor']:>6.3f}{r['sharpe']:>8.3f}"
+              f"{r['max_dd']:>6.2f}{r['trades']:>5}")
 
-    return results[0], results  # Best params, all results
+    return results[0], results
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────────────────────────────────────
+# ── MAIN ──────────────────────────────────────────────────────────────────────
 
-def run_backtest():
-    print("\n" + "="*60)
-    print("APEX BACKTEST v7 — CROSS-SECTIONAL MOMENTUM")
-    print("Walk-Forward Validation: 4-month in-sample / 2-month OOS")
+def run_full_backtest():
+    print("\n" + "="*65)
+    print("APEX BACKTEST v8 — EUR/USD MEAN REVERSION (FTMO-OPTIMISED)")
+    print("Walk-Forward: 4-month in-sample / 2-month out-of-sample")
     print(f"Date: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
-    print("="*60)
+    print("="*65)
 
-    symbols = [
-        "BTC/USD","ETH/USD","SOL/USD","AVAX/USD",
-        "LINK/USD","BCH/USD","LTC/USD","AAVE/USD"
-    ]
+    # ── Download data ──
+    print(f"\n[1/5] Downloading EUR/USD 6-month hourly data...")
+    all_bars, session_bars = fetch_eurusd(months=6)
 
-    print(f"\n[1/5] Downloading 6 months of data...")
-    all_bars = {}
-    for sym in symbols:
-        bars = fetch_historical(sym, months=6)
-        if bars:
-            all_bars[sym] = bars
-            print(f"  {sym}: {len(bars)} bars")
-    
-    if not all_bars:
-        print("No data downloaded. Exiting.")
+    if len(session_bars) < 500:
+        print("Insufficient data. Exiting.")
         return {}
 
-    # Find the bar counts
-    min_bars = min(len(v) for v in all_bars.values())
-    total_bars = min_bars
-
-    # Split: first 4 months in-sample, last 2 months out-of-sample
-    # 4 months ≈ 2928 bars (4 * 30 * 24.4), 2 months ≈ 1464 bars
-    is_end   = int(total_bars * (4/6))   # end of in-sample
+    total = len(session_bars)
+    # 4mo in-sample, 2mo out-of-sample
+    is_end    = int(total * (4/6))
     oos_start = is_end
-    oos_end  = total_bars
+    oos_end   = total
 
-    is_bars  = is_end
-    oos_bars = oos_end - oos_start
+    print(f"  Session bars total: {total}")
+    print(f"  In-sample:     0–{is_end} ({is_end} bars ≈ 4 months)")
+    print(f"  Out-of-sample: {oos_start}–{oos_end} "
+          f"({oos_end-oos_start} bars ≈ 2 months)")
+    print(f"  OOS data NEVER seen during optimisation")
 
-    print(f"\n  Total bars: {total_bars}")
-    print(f"  In-sample:     bars 0–{is_end} ({is_bars} bars ≈ 4 months)")
-    print(f"  Out-of-sample: bars {oos_start}–{oos_end} "
-          f"({oos_bars} bars ≈ 2 months)")
-    print(f"  OOS data was NEVER seen during optimisation")
+    # ── Phase 1: In-sample optimisation ──
+    print(f"\n[2/5] Phase 1 — In-sample optimisation (4 months)...")
+    best, all_results = optimise(session_bars, 0, is_end)
 
-    # ── Phase 1: In-sample optimisation ──────────────────────────────────────
-    print(f"\n[2/5] Phase 1 — In-sample parameter search (4 months)...")
-    best_params, all_is_results = optimise(
-        all_bars, list(all_bars.keys()), 0, is_end
-    )
+    if not best:
+        print("Optimisation failed. Exiting.")
+        return {}
+
+    best_params = {k: best[k] for k in
+                   ["bb_period","bb_std","rsi_period",
+                    "rsi_ob","rsi_os","atr_stop","atr_tp"]}
 
     print(f"\n  BEST IN-SAMPLE PARAMS:")
-    print(f"  Lookback: {best_params['lookback']}hrs | "
-          f"Hold: {best_params['hold_hrs']}hrs | "
-          f"Top N: {best_params['top_n']} | "
-          f"Skip: {best_params['skip_hrs']}hrs")
-    print(f"  In-sample Return: {best_params['return_pct']:+.2f}% | "
-          f"Sharpe: {best_params['sharpe']:.3f} | "
-          f"PF: {best_params['profit_factor']:.3f} | "
-          f"WR: {best_params['win_rate']:.1f}%")
+    for k, v in best_params.items():
+        print(f"    {k}: {v}")
+    print(f"  Return: {best['return_pct']:+.2f}% | "
+          f"Sharpe: {best['sharpe']:.3f} | "
+          f"WR: {best['win_rate']:.1f}% | "
+          f"PF: {best['profit_factor']:.3f} | "
+          f"DD: {best['max_dd']:.2f}%")
 
-    # ── Phase 2: Out-of-sample validation ────────────────────────────────────
+    # ── Phase 2: Out-of-sample validation ──
     print(f"\n[3/5] Phase 2 — Out-of-sample validation (2 months, BLIND)...")
-    print(f"  Using EXACTLY the params from in-sample — no further tuning")
+    oos = run_backtest(session_bars, oos_start, oos_end, best_params)
 
-    oos_result = run_cs_momentum(
-        all_bars, list(all_bars.keys()),
-        start_bar=oos_start, end_bar=oos_end,
-        lookback=best_params["lookback"],
-        hold_hrs=best_params["hold_hrs"],
-        top_n=best_params["top_n"],
-        skip_hrs=best_params["skip_hrs"],
-    )
+    print(f"  OOS Return: {oos['return_pct']:+.2f}% | "
+          f"Sharpe: {oos['sharpe']:.3f} | "
+          f"WR: {oos['win_rate']:.1f}% | "
+          f"Trades: {oos['trades']} | "
+          f"DD: {oos['max_dd']:.2f}%")
 
-    # ── Phase 3: Full 6-month run with best params ────────────────────────────
-    print(f"\n[4/5] Full 6-month run with best params...")
-    full_result = run_cs_momentum(
-        all_bars, list(all_bars.keys()),
-        start_bar=0, end_bar=total_bars,
-        lookback=best_params["lookback"],
-        hold_hrs=best_params["hold_hrs"],
-        top_n=best_params["top_n"],
-        skip_hrs=best_params["skip_hrs"],
-        starting_cash=300000,
-    )
+    # ── Phase 3: Full 6-month simulation ──
+    print(f"\n[4/5] Full 6-month FTMO simulation ($50K account)...")
+    full = run_backtest(session_bars, 0, total, best_params,
+                        starting_cash=50000)
 
-    prop_ready = full_result["return_pct"] >= 10 and full_result["max_dd"] < 10
-
-    # ── VERDICT ───────────────────────────────────────────────────────────────
-    print(f"\n{'='*60}")
+    # ── VERDICT ──
+    print(f"\n{'='*65}")
     print(f"WALK-FORWARD RESULTS")
-    print(f"{'='*60}")
-    print(f"\nBest params: lookback={best_params['lookback']}h | "
-          f"hold={best_params['hold_hrs']}h | "
-          f"top_n={best_params['top_n']} | "
-          f"skip={best_params['skip_hrs']}h")
-    print(f"\n{'PHASE':<22}{'RETURN':>9}{'WIN%':>7}{'TRADES':>8}"
+    print(f"{'='*65}")
+    print(f"\nBest params: BB({best_params['bb_period']},{best_params['bb_std']}) | "
+          f"RSI({best_params['rsi_period']},{best_params['rsi_ob']}/{best_params['rsi_os']}) | "
+          f"ATR stop={best_params['atr_stop']}x tp={best_params['atr_tp']}x")
+    print(f"\n{'PHASE':<24}{'RET%':>7}{'WR%':>6}{'TRADES':>8}"
           f"{'DD%':>7}{'SHARPE':>9}{'PF':>7}")
-    print(f"{'-'*62}")
-    print(f"{'In-sample (4mo)':<22}"
-          f"{best_params['return_pct']:>8.2f}%"
-          f"{best_params['win_rate']:>6.1f}%"
-          f"{best_params['trades']:>8}"
-          f"{best_params['max_dd']:>6.2f}%"
-          f"{best_params['sharpe']:>9.3f}"
-          f"{best_params['profit_factor']:>7.3f}")
-    print(f"{'Out-of-sample (2mo)':<22}"
-          f"{oos_result['return_pct']:>8.2f}%"
-          f"{oos_result['win_rate']:>6.1f}%"
-          f"{oos_result['trades']:>8}"
-          f"{oos_result['max_dd']:>6.2f}%"
-          f"{oos_result['sharpe']:>9.3f}"
-          f"{oos_result['profit_factor']:>7.3f}")
-    print(f"{'Full 6-month ($300K)':<22}"
-          f"{full_result['return_pct']:>8.2f}%"
-          f"{full_result['win_rate']:>6.1f}%"
-          f"{full_result['trades']:>8}"
-          f"{full_result['max_dd']:>6.2f}%"
-          f"{full_result['sharpe']:>9.3f}"
-          f"{full_result['profit_factor']:>7.3f}")
+    print(f"{'-'*65}")
+    print(f"{'In-sample (4mo)':<24}"
+          f"{best['return_pct']:>7.2f}%"
+          f"{best['win_rate']:>6.1f}%"
+          f"{best['trades']:>8}"
+          f"{best['max_dd']:>6.2f}%"
+          f"{best['sharpe']:>9.3f}"
+          f"{best['profit_factor']:>7.3f}")
+    print(f"{'Out-of-sample (2mo)':<24}"
+          f"{oos['return_pct']:>7.2f}%"
+          f"{oos['win_rate']:>6.1f}%"
+          f"{oos['trades']:>8}"
+          f"{oos['max_dd']:>6.2f}%"
+          f"{oos['sharpe']:>9.3f}"
+          f"{oos['profit_factor']:>7.3f}")
+    print(f"{'Full 6mo FTMO sim':<24}"
+          f"{full['return_pct']:>7.2f}%"
+          f"{full['win_rate']:>6.1f}%"
+          f"{full['trades']:>8}"
+          f"{full['max_dd']:>6.2f}%"
+          f"{full['sharpe']:>9.3f}"
+          f"{full['profit_factor']:>7.3f}")
 
-    print(f"\n$300K → ${full_result['final']:,.0f} | "
-          f"Profit: ${full_result['profit']:+,.0f}")
+    print(f"\n$50K account simulation:")
+    print(f"  $50,000 → ${full['final']:,.2f} | "
+          f"Profit: ${full['profit']:+,.2f}")
+    print(f"  Worst day: {full['worst_day_pct']:.2f}% "
+          f"(FTMO limit: -5.0%)")
+    print(f"  Max drawdown: {full['max_dd']:.2f}% "
+          f"(FTMO limit: 10.0%)")
+    print(f"  Trading days: {full['trading_days']} "
+          f"(FTMO minimum: 4)")
+    print(f"  Bot killed early: {'YES' if full['killed'] else 'NO'}")
 
-    # ── HONEST VERDICT ────────────────────────────────────────────────────────
-    print(f"\n{'='*60}")
+    # ── HONEST VERDICT ──
+    print(f"\n{'='*65}")
     print(f"HONEST VERDICT")
-    print(f"{'='*60}")
+    print(f"{'='*65}")
 
-    is_ret  = best_params["return_pct"]
-    oos_ret = oos_result["return_pct"]
-    decay   = is_ret - oos_ret  # performance decay from IS to OOS
+    is_ret  = best["return_pct"]
+    oos_ret = oos["return_pct"]
+    decay   = is_ret - oos_ret
 
-    if oos_result["sharpe"] > 0.5 and oos_ret > 0:
-        verdict = "EDGE DETECTED — OOS positive with decent Sharpe"
+    if oos["sharpe"] > 0.5 and oos_ret > 2.0:
+        verdict   = "STRONG EDGE — OOS positive with good Sharpe. Proceed."
         edge_real = True
-    elif oos_ret > 0 and oos_result["sharpe"] > 0:
-        verdict = "WEAK EDGE — OOS profitable but Sharpe too low to trust"
+        next_step = "Build live execution layer and paper trade for 2 weeks"
+    elif oos_ret > 0 and oos["sharpe"] > 0:
+        verdict   = "WEAK EDGE — OOS profitable but needs more validation"
         edge_real = False
-    elif abs(decay) < 3 and oos_ret > -2:
-        verdict = "INCONCLUSIVE — small decay but OOS not profitable"
+        next_step = "Test on additional time windows before risking fees"
+    elif abs(decay) < 2 and oos_ret > -1:
+        verdict   = "INCONCLUSIVE — small decay but not profitable OOS"
         edge_real = False
+        next_step = "Try different session (Asian session, different pair)"
     else:
-        verdict = "NO EDGE — significant decay from IS to OOS (likely overfit)"
+        verdict   = "NO EDGE — significant decay from IS to OOS"
         edge_real = False
+        next_step = "Try GBP/USD or different time window"
 
     print(f"\nIn-sample return:     {is_ret:+.2f}%")
     print(f"Out-of-sample return: {oos_ret:+.2f}%")
-    print(f"Performance decay:    {decay:+.2f}% (small = good, large = overfit)")
-    print(f"\nVerdict: {verdict}")
-    print(f"Prop Firm Ready (full run): "
-          f"{'YES' if prop_ready else 'NOT YET'}")
+    print(f"Performance decay:    {decay:+.2f}% "
+          f"(< 3% = good, > 5% = likely overfit)")
+    print(f"\nFTMO rule compliance (full sim):")
+    print(f"  Daily loss limit: {'PASS' if full['ftmo_daily_ok'] else 'FAIL'} "
+          f"(worst day: {full['worst_day_pct']:.2f}%)")
+    print(f"  Total drawdown:   {'PASS' if full['ftmo_total_ok'] else 'FAIL'} "
+          f"(max DD: {full['max_dd']:.2f}%)")
+    print(f"  Profit target:    {'PASS' if full['ftmo_target'] else 'NOT YET'} "
+          f"(return: {full['return_pct']:.2f}%)")
+    print(f"\nVerdict:    {verdict}")
+    print(f"Next step:  {next_step}")
 
-    if edge_real:
-        print(f"\nThis strategy has a measurable out-of-sample edge.")
-        print(f"Recommended next steps:")
-        print(f"  1. Test on a different 6-month window to confirm")
-        print(f"  2. Account for trading fees (~0.1% per trade)")
-        print(f"  3. If still positive after fees: consider live testing small")
-    else:
-        print(f"\nThis strategy does NOT show a reliable OOS edge.")
-        print(f"Do not risk real capital on these results.")
-        print(f"Next: try different hypothesis (funding rate, time-of-day, etc.)")
-
-    # ── Save ──────────────────────────────────────────────────────────────────
+    # ── Save ──
     summary = {
-        "type": "backtest_v7_cs_momentum",
-        "methodology": "walk_forward_4mo_in_2mo_oos",
-        "run_date": datetime.now(timezone.utc).isoformat(),
-        "best_params": {
-            "lookback":  best_params["lookback"],
-            "hold_hrs":  best_params["hold_hrs"],
-            "top_n":     best_params["top_n"],
-            "skip_hrs":  best_params["skip_hrs"],
-        },
-        "in_sample":     {k:v for k,v in best_params.items()
-                         if k not in ("equity_curve",)},
-        "out_of_sample": {k:v for k,v in oos_result.items()
-                         if k not in ("equity_curve",)},
-        "full_6mo":      {k:v for k,v in full_result.items()
-                         if k not in ("equity_curve",)},
+        "type":          "backtest_v8_eurusd_meanrev",
+        "methodology":   "walk_forward_4mo_in_2mo_oos",
+        "market":        "EUR/USD forex",
+        "strategy":      "Mean reversion London/NY session",
+        "run_date":      datetime.now(timezone.utc).isoformat(),
+        "best_params":   best_params,
+        "in_sample":     {k:v for k,v in best.items()
+                          if k not in ("equity_curve",)},
+        "out_of_sample": {k:v for k,v in oos.items()
+                          if k not in ("equity_curve",)},
+        "full_6mo":      {k:v for k,v in full.items()
+                          if k not in ("equity_curve",)},
         "edge_detected": edge_real,
         "verdict":       verdict,
-        "prop_firm_ready": prop_ready,
+        "next_step":     next_step,
+        "ftmo_50k_sim":  {
+            "start":        50000,
+            "end":          full["final"],
+            "profit":       full["profit"],
+            "daily_ok":     full["ftmo_daily_ok"],
+            "drawdown_ok":  full["ftmo_total_ok"],
+            "target_hit":   full["ftmo_target"],
+            "would_pass":   full["ftmo_pass"],
+        }
     }
 
     print(f"\n[5/5] Saving...")
@@ -503,29 +547,30 @@ def run_backtest():
         sb_key = os.environ.get("SUPABASE_KEY")
         if sb_url and sb_key:
             report_text = (
-                f"BACKTEST v7 — CROSS-SECTIONAL MOMENTUM\n"
-                f"Walk-Forward: 4mo in-sample / 2mo out-of-sample\n\n"
-                f"BEST PARAMS (found in-sample):\n"
-                f"  Lookback: {best_params['lookback']}h | "
-                f"Hold: {best_params['hold_hrs']}h | "
-                f"Top N: {best_params['top_n']} | "
-                f"Skip: {best_params['skip_hrs']}h\n\n"
+                f"BACKTEST v8 — EUR/USD MEAN REVERSION\n"
+                f"FTMO $50K Challenge Simulation\n\n"
+                f"PARAMS: BB({best_params['bb_period']},{best_params['bb_std']}) "
+                f"RSI({best_params['rsi_period']}) "
+                f"ATR stop={best_params['atr_stop']}x tp={best_params['atr_tp']}x\n\n"
                 f"RESULTS:\n"
-                f"In-sample (4mo):      {is_ret:+.2f}% | "
-                f"Sharpe: {best_params['sharpe']:.3f}\n"
-                f"Out-of-sample (2mo):  {oos_ret:+.2f}% | "
-                f"Sharpe: {oos_result['sharpe']:.3f}\n"
-                f"Full 6mo ($300K):     {full_result['return_pct']:+.2f}% | "
-                f"DD: {full_result['max_dd']:.2f}%\n\n"
-                f"VERDICT: {verdict}\n"
-                f"Edge real: {edge_real}\n"
-                f"Prop ready: {prop_ready}"
+                f"In-sample (4mo):     {is_ret:+.2f}% | "
+                f"Sharpe: {best['sharpe']:.3f}\n"
+                f"Out-of-sample (2mo): {oos_ret:+.2f}% | "
+                f"Sharpe: {oos['sharpe']:.3f}\n"
+                f"Full 6mo ($50K):     {full['return_pct']:+.2f}% | "
+                f"DD: {full['max_dd']:.2f}%\n\n"
+                f"FTMO COMPLIANCE:\n"
+                f"Daily loss: {'PASS' if full['ftmo_daily_ok'] else 'FAIL'}\n"
+                f"Max DD:     {'PASS' if full['ftmo_total_ok'] else 'FAIL'}\n"
+                f"Target:     {'PASS' if full['ftmo_target'] else 'NOT YET'}\n"
+                f"Would pass: {full['ftmo_pass']}\n\n"
+                f"VERDICT: {verdict}"
             )
             payload = json.dumps({
                 "week_ending":  datetime.now(timezone.utc).isoformat(),
                 "report_text":  report_text,
                 "bot_data":     summary,
-                "news_context": json.dumps({"type": "backtest_v7"}),
+                "news_context": json.dumps({"type": "backtest_v8"}),
             }).encode()
             req = urllib.request.Request(
                 f"{sb_url}/rest/v1/reports", data=payload,
@@ -544,7 +589,8 @@ def run_backtest():
     with open("backtest_results.json", "w") as f:
         json.dump(summary, f, indent=2, default=str)
     print(f"  Saved backtest_results.json")
+
     return summary
 
 if __name__ == "__main__":
-    run_backtest()
+    run_full_backtest()
