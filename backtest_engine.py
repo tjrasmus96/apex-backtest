@@ -1,60 +1,57 @@
 """
-APEX BACKTESTING ENGINE v5 — MEAN-REVERSION DOMINANT
-======================================================
-DIAGNOSIS FROM v4 RESULTS:
-  - 821 trend trades at PF 0.73, WR 27% = trend strategy destroying capital
-  - 308 mean-rev trades performing better despite fewer trades
-  - Crypto market Nov 2025 - May 2026 was predominantly RANGING/CHOPPY
-  - Regime detector was too loose — classified noise as "trending"
-  - Result: -4.2% combined, gap of 14.2% to target
+APEX BACKTEST v7 — CROSS-SECTIONAL MOMENTUM + WALK-FORWARD VALIDATION
+======================================================================
+HYPOTHESIS:
+  Crypto assets that have outperformed their peers over the past N hours
+  continue to outperform over the next M hours (momentum effect).
+  We go long the top-ranked assets and avoid (or short) the bottom-ranked.
+  This is market-structure based, not indicator-based.
 
-ROOT CAUSE:
-  ADX > 25 is NOT enough to confirm a real trend in crypto.
-  In a choppy market, ADX oscillates 20-30 constantly.
-  Trend trades were opening on weak signals and stopping out in 10hrs.
+WHY THIS IS DIFFERENT FROM PREVIOUS VERSIONS:
+  - Not relying on RSI/BB/EMA combinations (over-fitted before)
+  - Based on RELATIVE performance across assets, not absolute price levels
+  - Partially market-neutral: if all crypto dumps, we're in the top assets,
+    not just "everything is long"
+  - Documented in academic literature for equities AND crypto
 
-v5 FIXES:
-  [v5-1] TREND threshold massively raised:
-         Requires ADX > 40 AND slope > 4% AND 4H EMA aligned AND RSI 45-65
-         This cuts trend trades from 821 → ~50-80 (only real trends)
+HONEST METHODOLOGY — WALK-FORWARD VALIDATION:
+  Phase 1 — IN-SAMPLE  (months 1-4): Parameter optimisation
+  Phase 2 — OUT-OF-SAMPLE (months 5-6): Blind validation
+  
+  If it only works in-sample: the edge isn't real.
+  If it holds out-of-sample: we might have something.
+  This is the only honest way to test.
 
-  [v5-2] MEAN-REV is now the PRIMARY strategy
-         Fires in RANGING (ADX<25), NEUTRAL (ADX 25-35), AND weak trend
-         Added more sensitive entry: z-score -1.5 allowed with strong RSI
-         Minimum 3 independent signals still required
+PARAMETERS TESTED:
+  lookback  : how many hours to measure momentum (12, 24, 48, 72, 96)
+  hold_hrs  : how long to hold each position (4, 8, 12, 24)
+  top_n     : how many assets to hold at once (1, 2, 3)
+  skip_hrs  : skip most recent N hours to avoid reversal (0, 4, 8)
 
-  [v5-3] TREND minimum hold filter: 
-         Don't stop out trend trades in first 4 bars (4hrs)
-         Gives the trend time to develop before panic-stopping
+POSITION SIZING:
+  Equal weight across top_n positions
+  Max 20% of equity per position
+  Stop loss: 3x ATR (wider — momentum needs room to breathe)
+  No take profit: hold for hold_hrs then rebalance
 
-  [v5-4] MEAN-REV take profit split:
-         50% of position exits at 2x ATR (lock profit)
-         Remaining 50% runs to 4x ATR or signal reversal
-         This improves win rate and average win size simultaneously
-
-  [v5-5] POSITION SIZING tightened:
-         Risk per trade reduced to 0.8% of equity (was 1%)
-         Max single position 4% of equity (was 6%)
-         Fewer dollars at risk per trade = smaller drawdown
-
-  [v5-6] RANGING CONFIRMATION: Before mean-rev entry,
-         confirm price has been in a range for 10+ bars
-         (high-low range < 3x ATR over last 20 bars)
-         Prevents mean-rev entries at the START of a new trend
-
-TARGET: +10% return, <8% drawdown, Sharpe > 1.0, PF > 1.2
+SECONDARY STRATEGY — FUNDING RATE PROXY:
+  Uses price momentum as a proxy for crowded positioning
+  Extreme recent momentum (>8% in 24hrs) = likely crowded = fade signal
+  Tested separately to isolate its contribution
 """
 
-import json, math, urllib.request, os
+import json, math, urllib.request, os, itertools
 from datetime import datetime, timezone
 
-# ── DATA FETCHING ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# DATA
+# ─────────────────────────────────────────────────────────────────────────────
 
 def fetch_historical(symbol, months=6):
     yf_map = {
         "BTC/USD":"BTC-USD","ETH/USD":"ETH-USD","SOL/USD":"SOL-USD",
         "AVAX/USD":"AVAX-USD","LINK/USD":"LINK-USD","BCH/USD":"BCH-USD",
-        "LTC/USD":"LTC-USD","AAVE/USD":"AAVE-USD","UNI/USD":"UNI-USD",
+        "LTC/USD":"LTC-USD","AAVE/USD":"AAVE-USD",
     }
     yf_sym = yf_map.get(symbol, symbol.replace("/","-"))
     url = (f"https://query1.finance.yahoo.com/v8/finance/chart/{yf_sym}"
@@ -72,622 +69,463 @@ def fetch_historical(symbol, months=6):
             if c is None: continue
             bars.append({
                 "timestamp": ts,
-                "open":   ohlcv["open"][i]   or c,
+                "close":  c,
                 "high":   ohlcv["high"][i]   or c,
                 "low":    ohlcv["low"][i]    or c,
-                "close":  c,
                 "volume": ohlcv["volume"][i] or 0,
             })
-        print(f"  {symbol}: {len(bars)} bars")
         return bars
     except Exception as e:
         print(f"  {symbol}: failed — {e}")
         return []
 
-# ── INDICATORS ────────────────────────────────────────────────────────────────
-
-def calc_rsi(closes, period=14):
-    if len(closes) < period + 1: return 50.0
-    gains  = [max(closes[i]-closes[i-1], 0) for i in range(1, len(closes))]
-    losses = [max(closes[i-1]-closes[i], 0) for i in range(1, len(closes))]
-    ag = sum(gains[-period:])  / period
-    al = sum(losses[-period:]) / period
-    if al == 0: return 100.0
-    return 100 - 100 / (1 + ag/al)
-
-def calc_ema(closes, period):
-    if len(closes) < period: return closes[-1]
-    k = 2 / (period + 1)
-    ema = sum(closes[:period]) / period
-    for p in closes[period:]: ema = p*k + ema*(1-k)
-    return ema
-
-def calc_bb(closes, period=20):
-    if len(closes) < period:
-        c = closes[-1]; return c*1.02, c, c*0.98
-    sl = closes[-period:]; mid = sum(sl)/period
-    std = math.sqrt(sum((x-mid)**2 for x in sl)/period)
-    return mid+2*std, mid, mid-2*std
-
-def calc_adx(closes, period=14):
-    if len(closes) < period*2: return 20.0
-    tr   = [abs(closes[i]-closes[i-1]) for i in range(1, len(closes))]
-    atr  = sum(tr[-period:])/period or 1
-    dm_p = [max(closes[i]-closes[i-1], 0) for i in range(1, len(closes))]
-    dm_m = [max(closes[i-1]-closes[i], 0) for i in range(1, len(closes))]
-    di_p = sum(dm_p[-period:])/period/atr*100
-    di_m = sum(dm_m[-period:])/period/atr*100
-    if di_p+di_m == 0: return 20.0
-    return abs(di_p-di_m)/(di_p+di_m)*100
+# ─────────────────────────────────────────────────────────────────────────────
+# INDICATORS
+# ─────────────────────────────────────────────────────────────────────────────
 
 def calc_atr(closes, period=14):
-    if len(closes) < 2: return closes[-1]*0.02
+    if len(closes) < 2: return closes[-1] * 0.02
     trs = [abs(closes[i]-closes[i-1]) for i in range(1, len(closes))]
     return sum(trs[-period:]) / min(len(trs), period)
 
-def calc_zscore(closes, period=20):
-    if len(closes) < period: return 0.0
-    sl = closes[-period:]; mid = sum(sl)/period
-    std = math.sqrt(sum((x-mid)**2 for x in sl)/period) or 1
-    return (closes[-1]-mid)/std
-
-def calc_stoch_rsi(closes, period=14):
-    if len(closes) < period*2: return 50.0
-    rsi_vals = []
-    for i in range(period, len(closes)):
-        gains  = [max(closes[j]-closes[j-1], 0) for j in range(i-period+1, i+1)]
-        losses = [max(closes[j-1]-closes[j], 0) for j in range(i-period+1, i+1)]
-        ag = sum(gains)/period; al = sum(losses)/period
-        rsi_vals.append(100.0 if al==0 else 100-100/(1+ag/al))
-    if len(rsi_vals) < period: return 50.0
-    recent = rsi_vals[-period:]
-    mn, mx = min(recent), max(recent)
-    if mx == mn: return 50.0
-    return (rsi_vals[-1]-mn)/(mx-mn)*100
-
-def calc_volatility_ratio(closes, period=20):
-    """Ratio of current ATR to average ATR — detects vol spikes"""
-    if len(closes) < period*2: return 1.0
-    cur_atr = calc_atr(closes[-period:])
-    avg_atr = calc_atr(closes[-period*2:-period])
-    if avg_atr == 0: return 1.0
-    return cur_atr / avg_atr
-
-# ── REGIME DETECTION (v5: much stricter) ─────────────────────────────────────
-
-def detect_regime(closes):
+def momentum_return(closes, lookback, skip=0):
     """
-    v5: Stricter regime detection.
-    STRONG_TREND requires ADX>40 + slope>4% + full EMA stack
-    Most crypto time = RANGING or NEUTRAL → use mean-rev
+    Return over [lookback] hours, skipping most recent [skip] hours.
+    Skipping recent bars avoids short-term reversal contamination.
     """
-    if len(closes) < 60: return "NEUTRAL"
+    if len(closes) < lookback + skip + 1:
+        return 0.0
+    end   = len(closes) - 1 - skip
+    start = end - lookback
+    if start < 0: return 0.0
+    if closes[start] <= 0: return 0.0
+    return (closes[end] - closes[start]) / closes[start]
 
-    adx     = calc_adx(closes)
-    e20     = calc_ema(closes, 20)
-    e50     = calc_ema(closes, 50)
-    e100    = calc_ema(closes, min(100, len(closes)))
-    cur     = closes[-1]
-    slope20 = (closes[-1] - closes[-20]) / closes[-20] if closes[-20] > 0 else 0
-    vol_ratio = calc_volatility_ratio(closes)
+# ─────────────────────────────────────────────────────────────────────────────
+# CROSS-SECTIONAL MOMENTUM BACKTEST
+# ─────────────────────────────────────────────────────────────────────────────
 
-    # Extreme volatility spike = risk off
-    if vol_ratio > 2.5: return "VOLATILE"
-
-    # v5-1: STRONG TREND requires ALL of: ADX>40, slope>4%, full EMA stack
-    if (adx > 40 and slope20 > 0.04
-            and cur > e20 > e50 > e100):
-        return "STRONG_TREND_UP"
-    if (adx > 40 and slope20 < -0.04
-            and cur < e20 < e50 < e100):
-        return "STRONG_TREND_DOWN"
-
-    # Moderate trend — still high bar (ADX>32 + slope>2%)
-    if adx > 32 and slope20 > 0.02 and cur > e20 > e50:
-        return "TRENDING_UP"
-    if adx > 32 and slope20 < -0.02 and cur < e20 < e50:
-        return "TRENDING_DOWN"
-
-    # Everything else = ranging/neutral = mean-rev territory
-    if adx < 30: return "RANGING"
-    return "NEUTRAL"
-
-def is_confirmed_range(closes, atr):
+def run_cs_momentum(all_bars, symbols, start_bar, end_bar,
+                    lookback, hold_hrs, top_n, skip_hrs,
+                    starting_cash=100000, stop_atr_mult=3.0):
     """
-    v5-6: Confirm price has been consolidating before mean-rev entry.
-    High-low range over last 20 bars must be < 4x ATR.
-    Prevents catching a knife at the start of a new trend.
+    Core engine. Runs cross-sectional momentum over a bar range.
+    Returns results dict.
     """
-    if len(closes) < 20: return True
-    recent = closes[-20:]
-    rng = max(recent) - min(recent)
-    return rng < atr * 4.0
+    cash       = starting_cash
+    positions  = {}   # sym -> {qty, entry, entry_bar, value}
+    trades     = []
+    equity_curve = [cash]
+    peak       = cash
+    max_dd     = 0
 
-def get_btc_regime(btc_closes):
-    if len(btc_closes) < 60: return "NEUTRAL"
-    e20 = calc_ema(btc_closes, 20)
-    e50 = calc_ema(btc_closes, 50)
-    cur = btc_closes[-1]
-    adx = calc_adx(btc_closes)
-    slope = (btc_closes[-1] - btc_closes[-20]) / btc_closes[-20]
-    if cur > e20 > e50 and adx > 25 and slope > 0.01: return "BULL"
-    if cur < e20 < e50 and adx > 25 and slope < -0.01: return "BEAR"
-    return "NEUTRAL"
+    rebalance_every = hold_hrs  # rebalance every hold_hrs bars
 
-# ── STRATEGY SIGNALS ──────────────────────────────────────────────────────────
+    for i in range(max(lookback + skip_hrs + 1, 100), end_bar):
+        if i < start_bar:
+            equity_curve.append(cash)
+            continue
 
-def trend_signal(closes):
-    """
-    Called ONLY in STRONG_TREND / TRENDING regime.
-    v5-1: Very high bar — only the clearest trends.
-    """
-    if len(closes) < 80: return "HOLD", 0
+        # ── Equity snapshot ──
+        total = cash
+        for sym, pos in positions.items():
+            bars = all_bars.get(sym, [])
+            if i < len(bars):
+                total += pos["qty"] * bars[i]["close"]
+        equity_curve.append(total)
+        if total > peak: peak = total
+        dd = (peak - total) / peak * 100
+        if dd > max_dd: max_dd = dd
 
-    e20   = calc_ema(closes, 20)
-    e50   = calc_ema(closes, 50)
-    e100  = calc_ema(closes, min(100, len(closes)))
-    cur   = closes[-1]
-    slope = (closes[-1]-closes[-20])/closes[-20]
-    adx   = calc_adx(closes)
-    rsi   = calc_rsi(closes)
+        # ── Manage exits ──
+        for sym in list(positions.keys()):
+            bars = all_bars.get(sym, [])
+            if i >= len(bars): continue
+            pos    = positions[sym]
+            cur    = bars[i]["close"]
+            closes = [b["close"] for b in bars[:i+1]]
+            atr    = calc_atr(closes)
+            held   = i - pos["entry_bar"]
 
-    # 4H confirmation
-    c4h     = closes[::4]
-    e20_4h  = calc_ema(c4h, min(20, len(c4h)))
-    e50_4h  = calc_ema(c4h, min(50, len(c4h)))
-    bull_4h = c4h[-1] > e20_4h > e50_4h
-    bear_4h = c4h[-1] < e20_4h < e50_4h
+            # Stop loss
+            if cur < pos["entry"] - atr * stop_atr_mult:
+                profit = (cur - pos["entry"]) * pos["qty"]
+                cash  += cur * pos["qty"]
+                trades.append({"symbol":sym,"entry":pos["entry"],"exit":cur,
+                    "profit":profit,"bars_held":held,"reason":"Stop loss"})
+                del positions[sym]
+                continue
 
-    score = 0; agrees = 0
+            # Time exit: held for hold_hrs bars
+            if held >= hold_hrs:
+                profit = (cur - pos["entry"]) * pos["qty"]
+                cash  += cur * pos["qty"]
+                trades.append({"symbol":sym,"entry":pos["entry"],"exit":cur,
+                    "profit":profit,"bars_held":held,"reason":"Time exit"})
+                del positions[sym]
 
-    # Full EMA stack required
-    if cur > e20 > e50 > e100:   score += 4.0; agrees += 1
-    elif cur > e20 > e50:         score += 2.0; agrees += 0.5
-    elif cur < e20 < e50 < e100:  score -= 4.0; agrees += 1
-    elif cur < e20 < e50:         score -= 2.0; agrees += 0.5
-
-    # Strong slope
-    if slope > 0.05:    score += 2.5; agrees += 1
-    elif slope > 0.03:  score += 1.5; agrees += 0.5
-    elif slope < -0.05: score -= 2.5; agrees += 1
-    elif slope < -0.03: score -= 1.5; agrees += 0.5
-
-    # 4H alignment
-    if bull_4h:  score += 2.0; agrees += 1
-    elif bear_4h: score -= 2.0; agrees += 1
-
-    # RSI in trend zone (not overbought on entry)
-    if 45 < rsi < 65: score += 1.0; agrees += 0.5
-
-    if adx > 45: score *= 1.3
-    elif adx > 40: score *= 1.15
-
-    # v5-1: High threshold — only take the best trend setups
-    if score >= 5.0 and agrees >= 2.5 and bull_4h: return "BUY",  score
-    if score <= -4.5 and agrees >= 2.5 and bear_4h: return "SELL", score
-    return "HOLD", score
-
-
-def mean_rev_signal(closes, volumes=None):
-    """
-    v5-2: PRIMARY strategy. Fires in RANGING, NEUTRAL, and weak trend.
-    More sensitive entry while keeping quality high.
-    """
-    if len(closes) < 30: return "HOLD", 0
-
-    upper, mid, lower = calc_bb(closes)
-    rsi    = calc_rsi(closes)
-    z      = calc_zscore(closes)
-    stoch  = calc_stoch_rsi(closes)
-    cur    = closes[-1]
-    atr    = calc_atr(closes)
-
-    # v5-6: Confirm we're actually in a range, not a new trend
-    if not is_confirmed_range(closes, atr): return "HOLD", 0
-
-    # Volume confirmation
-    if volumes and len(volumes) >= 20:
-        avg_vol = sum(volumes[-20:])/20
-        if volumes[-1] < avg_vol * 0.6: return "HOLD", 0
-
-    score = 0; agrees = 0
-
-    # Bollinger Band position
-    if cur < lower:         score += 3.5; agrees += 1
-    elif cur < mid * 0.995: score += 1.5; agrees += 0.5
-    elif cur > upper:       score -= 3.5; agrees += 1
-    elif cur > mid * 1.005: score -= 1.5; agrees += 0.5
-
-    # Z-score (v5-2: slightly more sensitive, -1.5 allowed with strong RSI)
-    if z < -2.5:   score += 3.0; agrees += 1
-    elif z < -2.0: score += 2.0; agrees += 1
-    elif z < -1.5: score += 1.0; agrees += 0.5
-    elif z > 2.5:  score -= 3.0; agrees += 1
-    elif z > 2.0:  score -= 2.0; agrees += 1
-    elif z > 1.5:  score -= 1.0; agrees += 0.5
-
-    # RSI
-    if rsi < 20:   score += 3.0; agrees += 1
-    elif rsi < 30: score += 2.0; agrees += 1
-    elif rsi < 38: score += 1.0; agrees += 0.5
-    elif rsi > 80: score -= 3.0; agrees += 1
-    elif rsi > 70: score -= 2.0; agrees += 1
-    elif rsi > 62: score -= 1.0; agrees += 0.5
-
-    # StochRSI
-    if stoch < 10:  score += 2.0; agrees += 1
-    elif stoch < 20: score += 1.0; agrees += 0.5
-    elif stoch > 90: score -= 2.0; agrees += 1
-    elif stoch > 80: score -= 1.0; agrees += 0.5
-
-    # Funding rate proxy: panic selling = extra buy signal
-    mom10 = (closes[-1]-closes[-10])/closes[-10] if len(closes)>=10 else 0
-    if mom10 < -0.04 and rsi < 35: score += 1.5; agrees += 0.5
-    if mom10 > 0.06  and rsi > 65: score -= 1.5; agrees += 0.5
-
-    if score >= 4.0 and agrees >= 2.5: return "BUY",  score
-    if score <= -4.0 and agrees >= 2.5: return "SELL", score
-    return "HOLD", score
-
-# ── POSITION SIZING ───────────────────────────────────────────────────────────
-
-def calc_position_size(equity, atr, price, risk_pct=0.008, max_pct=0.04):
-    """
-    v5-5: Tighter sizing. Risk 0.8% per trade, max 4% of equity.
-    Small losses when wrong, reasonable gains when right.
-    """
-    risk_dollars = equity * risk_pct
-    atr_stop     = atr * 1.5
-    if atr_stop <= 0 or price <= 0: return None
-    qty   = risk_dollars / atr_stop
-    spend = qty * price
-    max_spend = equity * max_pct
-    if spend > max_spend:
-        spend = max_spend
-        qty   = spend / price
-    if spend < 10: return None
-    return spend, qty
-
-# ── BACKTEST ENGINE ───────────────────────────────────────────────────────────
-
-class RegimeAdaptiveBacktest:
-    def __init__(self, name, symbols, cash=100000,
-                 portfolio_dd_brake=0.06,
-                 portfolio_dd_resume=0.03):
-        self.name       = name
-        self.symbols    = symbols
-        self.cash       = cash
-        self.starting   = cash
-        self.positions  = {}
-        self.trades     = []
-        self.equity_curve = [cash]
-        self.peak       = cash
-        self.max_dd     = 0
-        self.dd_brake_active = False
-        self.portfolio_dd_brake  = portfolio_dd_brake
-        self.portfolio_dd_resume = portfolio_dd_resume
-        self.daily_pnl  = 0
-        self.last_day   = None
-
-    def _close(self, sym, pos, cur, bar_idx, reason):
-        profit = (cur - pos["entry"]) * pos["qty"]
-        self.cash += cur * pos["qty"]
-        self.daily_pnl += profit
-        self.trades.append({
-            "symbol": sym, "entry": pos["entry"], "exit": cur,
-            "qty": pos["qty"], "profit": profit,
-            "profit_pct": profit/pos["value"]*100 if pos["value"] else 0,
-            "reason": reason,
-            "bars_held": bar_idx - pos["entry_idx"],
-            "strategy": pos.get("strategy","?"),
-        })
-        if sym in self.positions:
-            del self.positions[sym]
-
-    def run(self, all_bars):
-        max_len  = max((len(all_bars.get(s,[])) for s in self.symbols), default=0)
-        btc_bars = all_bars.get("BTC/USD", [])
-        print(f"  [{self.name}] {max_len} bars, {len(self.symbols)} symbols...")
-
-        for i in range(100, max_len):
-            # Portfolio equity
-            total = self.cash
-            for sym, pos in self.positions.items():
-                bars = all_bars.get(sym, [])
-                if i < len(bars):
-                    total += pos["qty"] * bars[i]["close"]
-            self.equity_curve.append(total)
-            if total > self.peak: self.peak = total
-            dd = (self.peak - total) / self.peak * 100
-            if dd > self.max_dd: self.max_dd = dd
-
-            # Portfolio drawdown brake
-            if dd >= self.portfolio_dd_brake * 100:
-                self.dd_brake_active = True
-            elif dd <= self.portfolio_dd_resume * 100:
-                self.dd_brake_active = False
-
-            # Daily loss guard
-            for sym in self.symbols:
-                bars = all_bars.get(sym, [])
-                if i < len(bars):
-                    ts  = bars[i].get("timestamp", 0)
-                    day = ts // 86400
-                    if self.last_day != day:
-                        self.daily_pnl = 0
-                        self.last_day  = day
-                    break
-            daily_blocked = self.daily_pnl < -(self.starting * 0.018)
-
-            # BTC macro filter
-            btc_closes = [b["close"] for b in btc_bars[:i+1]] if btc_bars else []
-            btc_regime = get_btc_regime(btc_closes) if len(btc_closes) >= 60 else "NEUTRAL"
-            btc_mult   = 0.5 if btc_regime == "BEAR" else 1.0
-
-            for sym in self.symbols:
+        # ── Rebalance: rank and enter top N ──
+        if i % rebalance_every == 0:
+            # Close any remaining positions on rebalance
+            for sym in list(positions.keys()):
                 bars = all_bars.get(sym, [])
                 if i >= len(bars): continue
-                closes  = [b["close"] for b in bars[:i+1]]
-                volumes = [b["volume"] for b in bars[:i+1]]
-                cur     = closes[-1]
-                atr     = calc_atr(closes)
-                held    = sym in self.positions
+                pos  = positions[sym]
+                cur  = bars[i]["close"]
+                held = i - pos["entry_bar"]
+                profit = (cur - pos["entry"]) * pos["qty"]
+                cash  += cur * pos["qty"]
+                trades.append({"symbol":sym,"entry":pos["entry"],"exit":cur,
+                    "profit":profit,"bars_held":held,"reason":"Rebalance"})
+            positions = {}
 
-                regime = detect_regime(closes)
+            # Rank all symbols by momentum
+            scores = {}
+            for sym in symbols:
+                bars = all_bars.get(sym, [])
+                if i >= len(bars): continue
+                closes = [b["close"] for b in bars[:i+1]]
+                scores[sym] = momentum_return(closes, lookback, skip_hrs)
 
-                # ── Manage open position ──
-                if held:
-                    pos       = self.positions[sym]
-                    entry     = pos["entry"]
-                    strat     = pos["strategy"]
-                    bars_held = i - pos["entry_idx"]
-                    profit    = (cur - entry) * pos["qty"]
+            if not scores: continue
 
-                    # v5-3: Minimum hold — don't stop out trend in first 4 bars
-                    min_hold = 4 if strat == "TREND" else 0
+            # Sort: best momentum first
+            ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
 
-                    if bars_held >= min_hold:
-                        # Trailing stop for strong trend positions
-                        if strat == "TREND" and profit > 0 and cur > entry + atr*2.0:
-                            if cur > pos.get("trail_high", cur):
-                                pos["trail_high"] = cur
-                            if cur < pos["trail_high"] * 0.975:
-                                self._close(sym, pos, cur, i, "Trail stop"); continue
+            # Enter top_n positions
+            n_to_enter = min(top_n, len(ranked))
+            # Only enter if momentum is positive (don't buy falling assets)
+            candidates = [(s, sc) for s, sc in ranked[:n_to_enter] if sc > 0]
 
-                        # Hard stop loss: 1.5x ATR
-                        if cur < entry - atr * 1.5:
-                            self._close(sym, pos, cur, i, "Stop loss"); continue
+            if not candidates: continue
 
-                        # Mean-rev take profit: dynamic
-                        adx_now = calc_adx(closes)
-                        tp_mult = 3.5 if adx_now < 25 else 2.5
-                        if strat == "MEAN_REV" and cur > entry + atr * tp_mult:
-                            self._close(sym, pos, cur, i, "Take profit"); continue
+            alloc_per = total / len(candidates)
+            alloc_per = min(alloc_per, total * 0.20)  # max 20% each
 
-                        # Trend fixed TP (if not trailing yet)
-                        if strat == "TREND" and cur > entry + atr * 4.5:
-                            self._close(sym, pos, cur, i, "Take profit"); continue
+            for sym, score in candidates:
+                if cash < 10: break
+                bars = all_bars.get(sym, [])
+                if i >= len(bars): continue
+                cur   = bars[i]["close"]
+                spend = min(alloc_per, cash * 0.95)
+                if spend < 10: continue
+                qty   = spend / cur
+                cash -= spend
+                positions[sym] = {
+                    "qty": qty, "entry": cur,
+                    "entry_bar": i, "value": spend,
+                    "score": score,
+                }
 
-                        # Exit mean-rev if regime flips to strong trend
-                        if strat == "MEAN_REV" and "STRONG_TREND" in regime:
-                            self._close(sym, pos, cur, i, "Regime flip exit"); continue
+    # Close all remaining
+    for sym, pos in list(positions.items()):
+        bars = all_bars.get(sym, [])
+        if not bars: continue
+        cur    = bars[min(end_bar-1, len(bars)-1)]["close"]
+        profit = (cur - pos["entry"]) * pos["qty"]
+        cash  += cur * pos["qty"]
+        trades.append({"symbol":sym,"entry":pos["entry"],"exit":cur,
+            "profit":profit,"bars_held":end_bar-pos["entry_bar"],
+            "reason":"End"})
 
-                # ── Entry logic ──
-                if held: continue
-                if self.dd_brake_active or daily_blocked: continue
-                if len(self.positions) >= 4: continue
+    final   = cash
+    ret     = (final - starting_cash) / starting_cash * 100
+    wins    = [t for t in trades if t["profit"] > 0]
+    losses  = [t for t in trades if t["profit"] <= 0]
+    wr      = len(wins)/len(trades)*100 if trades else 0
+    pf      = (sum(t["profit"] for t in wins) /
+               abs(sum(t["profit"] for t in losses))
+               if wins and losses else 0)
+    avg_win  = sum(t["profit"] for t in wins)/len(wins)     if wins   else 0
+    avg_loss = abs(sum(t["profit"] for t in losses)/len(losses)) if losses else 0
 
-                sig = "HOLD"; score = 0; strat_used = None
+    # Sharpe
+    if len(equity_curve) > 1:
+        rets  = [(equity_curve[i]-equity_curve[i-1])/equity_curve[i-1]
+                 for i in range(1,len(equity_curve)) if equity_curve[i-1]>0]
+        avg_r = sum(rets)/len(rets) if rets else 0
+        std_r = math.sqrt(sum((r-avg_r)**2 for r in rets)/len(rets)) if rets else 1
+        sharpe = avg_r/std_r*math.sqrt(24*365) if std_r > 0 else 0
+    else:
+        sharpe = 0
 
-                if regime in ("STRONG_TREND_UP","STRONG_TREND_DOWN",
-                               "TRENDING_UP","TRENDING_DOWN"):
-                    sig, score = trend_signal(closes)
-                    strat_used = "TREND"
-                elif regime in ("RANGING","NEUTRAL"):
-                    sig, score = mean_rev_signal(closes, volumes)
-                    strat_used = "MEAN_REV"
-                # VOLATILE = stay flat
+    return {
+        "return_pct":     round(ret, 3),
+        "final":          round(final, 2),
+        "profit":         round(final - starting_cash, 2),
+        "trades":         len(trades),
+        "win_rate":       round(wr, 1),
+        "profit_factor":  round(pf, 3),
+        "avg_win":        round(avg_win, 2),
+        "avg_loss":       round(avg_loss, 2),
+        "max_dd":         round(max_dd, 2),
+        "sharpe":         round(sharpe, 3),
+        "equity_curve":   [round(e,2) for e in equity_curve[::20]],
+    }
 
-                if sig == "BUY" and self.cash > 50:
-                    result = calc_position_size(total, atr, cur)
-                    if result:
-                        spend, qty = result
-                        spend = min(spend * btc_mult, self.cash * 0.9)
-                        qty   = spend / cur
-                        if spend > 10:
-                            self.cash -= spend
-                            self.positions[sym] = {
-                                "qty": qty, "entry": cur,
-                                "entry_idx": i, "value": spend,
-                                "score": score, "strategy": strat_used,
-                                "trail_high": cur,
-                                "adx": calc_adx(closes),
-                            }
-                elif sig == "SELL" and held:
-                    self._close(sym, self.positions[sym], cur, i, "Signal")
+# ─────────────────────────────────────────────────────────────────────────────
+# PARAMETER OPTIMISATION (in-sample only)
+# ─────────────────────────────────────────────────────────────────────────────
 
-        # Close all remaining
-        for sym, pos in list(self.positions.items()):
-            bars = all_bars.get(sym, [])
-            if not bars: continue
-            self._close(sym, pos, bars[-1]["close"], max_len, "End of period")
+def optimise(all_bars, symbols, is_start, is_end):
+    """
+    Grid search over parameters on IN-SAMPLE data only.
+    Returns best parameter set by Sharpe (not return — avoids overfit to return).
+    """
+    lookbacks  = [12, 24, 48, 72, 96]
+    hold_hrss  = [4, 8, 12, 24]
+    top_ns     = [1, 2, 3]
+    skip_hrss  = [0, 4, 8]
 
-    def results(self):
-        final = self.cash
-        ret   = (final - self.starting) / self.starting * 100
-        wins    = [t for t in self.trades if t["profit"] > 0]
-        losses  = [t for t in self.trades if t["profit"] <= 0]
-        wr  = len(wins)/len(self.trades)*100 if self.trades else 0
-        avg_win  = sum(t["profit"] for t in wins)/len(wins)     if wins   else 0
-        avg_loss = abs(sum(t["profit"] for t in losses)/len(losses)) if losses else 0
-        pf = (sum(t["profit"] for t in wins) /
-              abs(sum(t["profit"] for t in losses))
-              if losses and wins else 0)
-        if len(self.equity_curve) > 1:
-            rets  = [(self.equity_curve[i]-self.equity_curve[i-1])/
-                      self.equity_curve[i-1]
-                     for i in range(1, len(self.equity_curve))]
-            avg_r = sum(rets)/len(rets)
-            std_r = math.sqrt(sum((r-avg_r)**2 for r in rets)/len(rets)) if rets else 1
-            sharpe = avg_r/std_r*math.sqrt(24*365) if std_r > 0 else 0
-        else:
-            sharpe = 0
-        by_sym = {}
-        for t in self.trades:
-            by_sym[t["symbol"]] = by_sym.get(t["symbol"],0) + t["profit"]
-        best  = max(by_sym, key=by_sym.get) if by_sym else "N/A"
-        worst = min(by_sym, key=by_sym.get) if by_sym else "N/A"
-        trend_t = [t for t in self.trades if t.get("strategy")=="TREND"]
-        rev_t   = [t for t in self.trades if t.get("strategy")=="MEAN_REV"]
-        avg_hold = (sum(t["bars_held"] for t in self.trades)/
-                    len(self.trades)) if self.trades else 0
-        return {
-            "strategy": self.name, "starting": self.starting,
-            "final": round(final,2), "return_pct": round(ret,2),
-            "profit": round(final-self.starting,2),
-            "trades": len(self.trades), "wins": len(wins), "losses": len(losses),
-            "win_rate": round(wr,1), "avg_win": round(avg_win,2),
-            "avg_loss": round(avg_loss,2), "profit_factor": round(pf,2),
-            "max_dd": round(self.max_dd,2), "sharpe": round(sharpe,2),
-            "avg_hold_hrs": round(avg_hold,1),
-            "best_symbol": best,  "best_pnl":  round(by_sym.get(best,0),2),
-            "worst_symbol": worst,"worst_pnl": round(by_sym.get(worst,0),2),
-            "trend_trades": len(trend_t), "mean_rev_trades": len(rev_t),
-            "equity_curve": [round(e,2) for e in self.equity_curve[::20]],
-        }
+    results = []
+    total_combos = len(lookbacks)*len(hold_hrss)*len(top_ns)*len(skip_hrss)
+    print(f"  Testing {total_combos} parameter combinations in-sample...")
 
-# ── MAIN ──────────────────────────────────────────────────────────────────────
+    for lookback, hold_hrs, top_n, skip_hrs in itertools.product(
+            lookbacks, hold_hrss, top_ns, skip_hrss):
+        r = run_cs_momentum(
+            all_bars, symbols, is_start, is_end,
+            lookback=lookback, hold_hrs=hold_hrs,
+            top_n=top_n, skip_hrs=skip_hrs,
+        )
+        results.append({
+            "lookback": lookback, "hold_hrs": hold_hrs,
+            "top_n": top_n, "skip_hrs": skip_hrs,
+            **r
+        })
+
+    # Sort by Sharpe (most robust metric — penalises volatile returns)
+    results.sort(key=lambda x: x["sharpe"], reverse=True)
+
+    print(f"\n  Top 5 in-sample parameter sets (by Sharpe):")
+    print(f"  {'LB':>4} {'Hold':>5} {'TopN':>5} {'Skip':>5} "
+          f"{'Ret%':>7} {'WR%':>6} {'PF':>6} {'Sharpe':>8} {'DD%':>6}")
+    print(f"  {'-'*60}")
+    for r in results[:5]:
+        print(f"  {r['lookback']:>4} {r['hold_hrs']:>5} {r['top_n']:>5} "
+              f"{r['skip_hrs']:>5} {r['return_pct']:>7.2f} "
+              f"{r['win_rate']:>6.1f} {r['profit_factor']:>6.3f} "
+              f"{r['sharpe']:>8.3f} {r['max_dd']:>6.2f}")
+
+    return results[0], results  # Best params, all results
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────────────────────
 
 def run_backtest():
     print("\n" + "="*60)
-    print("APEX BACKTEST v5 — MEAN-REVERSION DOMINANT")
-    print("Trend fires only on ADX>40 + confirmed EMA stack")
+    print("APEX BACKTEST v7 — CROSS-SECTIONAL MOMENTUM")
+    print("Walk-Forward Validation: 4-month in-sample / 2-month OOS")
     print(f"Date: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
     print("="*60)
 
-    bot1_syms = ["BTC/USD","ETH/USD","SOL/USD","AVAX/USD","LINK/USD"]
-    bot2_syms = ["ETH/USD","BCH/USD","LTC/USD","AAVE/USD","BTC/USD","AVAX/USD"]
-    bot3_syms = ["BTC/USD","ETH/USD","SOL/USD","AVAX/USD","LINK/USD","LTC/USD"]
-    all_syms  = list(set(bot1_syms + bot2_syms + bot3_syms))
+    symbols = [
+        "BTC/USD","ETH/USD","SOL/USD","AVAX/USD",
+        "LINK/USD","BCH/USD","LTC/USD","AAVE/USD"
+    ]
 
-    print(f"\n[1/4] Downloading 6 months of real data...")
+    print(f"\n[1/5] Downloading 6 months of data...")
     all_bars = {}
-    for sym in all_syms:
+    for sym in symbols:
         bars = fetch_historical(sym, months=6)
-        if bars: all_bars[sym] = bars
-    total_bars = sum(len(v) for v in all_bars.values())
-    print(f"  {len(all_bars)} symbols, {total_bars:,} bars total")
+        if bars:
+            all_bars[sym] = bars
+            print(f"  {sym}: {len(bars)} bars")
+    
+    if not all_bars:
+        print("No data downloaded. Exiting.")
+        return {}
 
-    print(f"\n[2/4] Running v5 backtests...")
-    bt1 = RegimeAdaptiveBacktest("REGIME_BOT_1", bot1_syms, cash=100000)
-    bt1.run({k: all_bars.get(k,[]) for k in bot1_syms})
-    r1 = bt1.results()
+    # Find the bar counts
+    min_bars = min(len(v) for v in all_bars.values())
+    total_bars = min_bars
 
-    bt2 = RegimeAdaptiveBacktest("REGIME_BOT_2", bot2_syms, cash=100000)
-    bt2.run({k: all_bars.get(k,[]) for k in bot2_syms})
-    r2 = bt2.results()
+    # Split: first 4 months in-sample, last 2 months out-of-sample
+    # 4 months ≈ 2928 bars (4 * 30 * 24.4), 2 months ≈ 1464 bars
+    is_end   = int(total_bars * (4/6))   # end of in-sample
+    oos_start = is_end
+    oos_end  = total_bars
 
-    bt3 = RegimeAdaptiveBacktest("REGIME_BOT_3", bot3_syms, cash=100000)
-    bt3.run({k: all_bars.get(k,[]) for k in bot3_syms})
-    r3 = bt3.results()
+    is_bars  = is_end
+    oos_bars = oos_end - oos_start
 
-    results      = [r1, r2, r3]
-    total_start  = 300000
-    total_final  = r1["final"] + r2["final"] + r3["final"]
-    total_ret    = (total_final - total_start) / total_start * 100
-    total_trades = r1["trades"] + r2["trades"] + r3["trades"]
-    total_wins   = r1["wins"]   + r2["wins"]   + r3["wins"]
-    combined_wr  = total_wins / total_trades * 100 if total_trades else 0
-    worst_dd     = max(r["max_dd"] for r in results)
-    avg_pf       = sum(r["profit_factor"] for r in results) / 3
-    avg_sharpe   = sum(r["sharpe"] for r in results) / 3
-    prop_ready   = total_ret >= 10 and worst_dd < 10
-    total_trend  = sum(r["trend_trades"]    for r in results)
-    total_rev    = sum(r["mean_rev_trades"] for r in results)
+    print(f"\n  Total bars: {total_bars}")
+    print(f"  In-sample:     bars 0–{is_end} ({is_bars} bars ≈ 4 months)")
+    print(f"  Out-of-sample: bars {oos_start}–{oos_end} "
+          f"({oos_bars} bars ≈ 2 months)")
+    print(f"  OOS data was NEVER seen during optimisation")
 
+    # ── Phase 1: In-sample optimisation ──────────────────────────────────────
+    print(f"\n[2/5] Phase 1 — In-sample parameter search (4 months)...")
+    best_params, all_is_results = optimise(
+        all_bars, list(all_bars.keys()), 0, is_end
+    )
+
+    print(f"\n  BEST IN-SAMPLE PARAMS:")
+    print(f"  Lookback: {best_params['lookback']}hrs | "
+          f"Hold: {best_params['hold_hrs']}hrs | "
+          f"Top N: {best_params['top_n']} | "
+          f"Skip: {best_params['skip_hrs']}hrs")
+    print(f"  In-sample Return: {best_params['return_pct']:+.2f}% | "
+          f"Sharpe: {best_params['sharpe']:.3f} | "
+          f"PF: {best_params['profit_factor']:.3f} | "
+          f"WR: {best_params['win_rate']:.1f}%")
+
+    # ── Phase 2: Out-of-sample validation ────────────────────────────────────
+    print(f"\n[3/5] Phase 2 — Out-of-sample validation (2 months, BLIND)...")
+    print(f"  Using EXACTLY the params from in-sample — no further tuning")
+
+    oos_result = run_cs_momentum(
+        all_bars, list(all_bars.keys()),
+        start_bar=oos_start, end_bar=oos_end,
+        lookback=best_params["lookback"],
+        hold_hrs=best_params["hold_hrs"],
+        top_n=best_params["top_n"],
+        skip_hrs=best_params["skip_hrs"],
+    )
+
+    # ── Phase 3: Full 6-month run with best params ────────────────────────────
+    print(f"\n[4/5] Full 6-month run with best params...")
+    full_result = run_cs_momentum(
+        all_bars, list(all_bars.keys()),
+        start_bar=0, end_bar=total_bars,
+        lookback=best_params["lookback"],
+        hold_hrs=best_params["hold_hrs"],
+        top_n=best_params["top_n"],
+        skip_hrs=best_params["skip_hrs"],
+        starting_cash=300000,
+    )
+
+    prop_ready = full_result["return_pct"] >= 10 and full_result["max_dd"] < 10
+
+    # ── VERDICT ───────────────────────────────────────────────────────────────
+    print(f"\n{'='*60}")
+    print(f"WALK-FORWARD RESULTS")
+    print(f"{'='*60}")
+    print(f"\nBest params: lookback={best_params['lookback']}h | "
+          f"hold={best_params['hold_hrs']}h | "
+          f"top_n={best_params['top_n']} | "
+          f"skip={best_params['skip_hrs']}h")
+    print(f"\n{'PHASE':<22}{'RETURN':>9}{'WIN%':>7}{'TRADES':>8}"
+          f"{'DD%':>7}{'SHARPE':>9}{'PF':>7}")
+    print(f"{'-'*62}")
+    print(f"{'In-sample (4mo)':<22}"
+          f"{best_params['return_pct']:>8.2f}%"
+          f"{best_params['win_rate']:>6.1f}%"
+          f"{best_params['trades']:>8}"
+          f"{best_params['max_dd']:>6.2f}%"
+          f"{best_params['sharpe']:>9.3f}"
+          f"{best_params['profit_factor']:>7.3f}")
+    print(f"{'Out-of-sample (2mo)':<22}"
+          f"{oos_result['return_pct']:>8.2f}%"
+          f"{oos_result['win_rate']:>6.1f}%"
+          f"{oos_result['trades']:>8}"
+          f"{oos_result['max_dd']:>6.2f}%"
+          f"{oos_result['sharpe']:>9.3f}"
+          f"{oos_result['profit_factor']:>7.3f}")
+    print(f"{'Full 6-month ($300K)':<22}"
+          f"{full_result['return_pct']:>8.2f}%"
+          f"{full_result['win_rate']:>6.1f}%"
+          f"{full_result['trades']:>8}"
+          f"{full_result['max_dd']:>6.2f}%"
+          f"{full_result['sharpe']:>9.3f}"
+          f"{full_result['profit_factor']:>7.3f}")
+
+    print(f"\n$300K → ${full_result['final']:,.0f} | "
+          f"Profit: ${full_result['profit']:+,.0f}")
+
+    # ── HONEST VERDICT ────────────────────────────────────────────────────────
+    print(f"\n{'='*60}")
+    print(f"HONEST VERDICT")
+    print(f"{'='*60}")
+
+    is_ret  = best_params["return_pct"]
+    oos_ret = oos_result["return_pct"]
+    decay   = is_ret - oos_ret  # performance decay from IS to OOS
+
+    if oos_result["sharpe"] > 0.5 and oos_ret > 0:
+        verdict = "EDGE DETECTED — OOS positive with decent Sharpe"
+        edge_real = True
+    elif oos_ret > 0 and oos_result["sharpe"] > 0:
+        verdict = "WEAK EDGE — OOS profitable but Sharpe too low to trust"
+        edge_real = False
+    elif abs(decay) < 3 and oos_ret > -2:
+        verdict = "INCONCLUSIVE — small decay but OOS not profitable"
+        edge_real = False
+    else:
+        verdict = "NO EDGE — significant decay from IS to OOS (likely overfit)"
+        edge_real = False
+
+    print(f"\nIn-sample return:     {is_ret:+.2f}%")
+    print(f"Out-of-sample return: {oos_ret:+.2f}%")
+    print(f"Performance decay:    {decay:+.2f}% (small = good, large = overfit)")
+    print(f"\nVerdict: {verdict}")
+    print(f"Prop Firm Ready (full run): "
+          f"{'YES' if prop_ready else 'NOT YET'}")
+
+    if edge_real:
+        print(f"\nThis strategy has a measurable out-of-sample edge.")
+        print(f"Recommended next steps:")
+        print(f"  1. Test on a different 6-month window to confirm")
+        print(f"  2. Account for trading fees (~0.1% per trade)")
+        print(f"  3. If still positive after fees: consider live testing small")
+    else:
+        print(f"\nThis strategy does NOT show a reliable OOS edge.")
+        print(f"Do not risk real capital on these results.")
+        print(f"Next: try different hypothesis (funding rate, time-of-day, etc.)")
+
+    # ── Save ──────────────────────────────────────────────────────────────────
     summary = {
-        "type": "backtest_v5", "version": "mean_rev_dominant",
-        "period": "6 months",
+        "type": "backtest_v7_cs_momentum",
+        "methodology": "walk_forward_4mo_in_2mo_oos",
         "run_date": datetime.now(timezone.utc).isoformat(),
-        "total_start": total_start,
-        "total_final": round(total_final, 2),
-        "total_return_pct": round(total_ret, 2),
-        "total_profit": round(total_final - total_start, 2),
-        "total_trades": total_trades,
-        "trend_trades": total_trend,
-        "mean_rev_trades": total_rev,
-        "combined_win_rate": round(combined_wr, 1),
-        "worst_drawdown": round(worst_dd, 2),
-        "avg_profit_factor": round(avg_pf, 2),
-        "avg_sharpe": round(avg_sharpe, 2),
+        "best_params": {
+            "lookback":  best_params["lookback"],
+            "hold_hrs":  best_params["hold_hrs"],
+            "top_n":     best_params["top_n"],
+            "skip_hrs":  best_params["skip_hrs"],
+        },
+        "in_sample":     {k:v for k,v in best_params.items()
+                         if k not in ("equity_curve",)},
+        "out_of_sample": {k:v for k,v in oos_result.items()
+                         if k not in ("equity_curve",)},
+        "full_6mo":      {k:v for k,v in full_result.items()
+                         if k not in ("equity_curve",)},
+        "edge_detected": edge_real,
+        "verdict":       verdict,
         "prop_firm_ready": prop_ready,
-        "strategies": results,
     }
 
-    print(f"\n[3/4] RESULTS — v5 MEAN-REV DOMINANT")
-    print(f"\n{'BOT':<16}{'RETURN':>9}{'WIN%':>7}{'TRADES':>8}"
-          f"{'DD%':>7}{'SHARPE':>8}{'PF':>6}")
-    print("-"*62)
-    for r in results:
-        print(f"{r['strategy']:<16}{r['return_pct']:>8.1f}%{r['win_rate']:>6.1f}%"
-              f"{r['trades']:>8}{r['max_dd']:>6.1f}%"
-              f"{r['sharpe']:>8.2f}{r['profit_factor']:>6.2f}")
-    print(f"\n{'COMBINED':<16}{total_ret:>8.1f}%{combined_wr:>6.1f}%"
-          f"{total_trades:>8}{worst_dd:>6.1f}%")
-    print(f"\n$300K → ${total_final:,.0f} | Profit: ${total_final-total_start:+,.0f}")
-    print(f"Avg Profit Factor: {avg_pf:.2f} | Avg Sharpe: {avg_sharpe:.2f}")
-    print(f"Trade split: {total_trend} trend / {total_rev} mean-rev")
-    print(f"\nProp Firm Ready: {'YES — Apply Now!' if prop_ready else 'NOT YET'}")
-
-    if not prop_ready:
-        print(f"\nGap to target:")
-        if total_ret < 10:
-            print(f"  Return:   {total_ret:.1f}% (need 10.0%, gap = {10-total_ret:.1f}%)")
-        if worst_dd >= 10:
-            print(f"  Drawdown: {worst_dd:.1f}% (need < 10%)")
-
-    print(f"\nPer Bot:")
-    for r in results:
-        print(f"  {r['strategy']}: {r['return_pct']:+.1f}% | "
-              f"WR:{r['win_rate']:.0f}% | "
-              f"Avg hold {r['avg_hold_hrs']:.0f}hrs | "
-              f"Best:{r['best_symbol']} ${r['best_pnl']:+,.0f} | "
-              f"Trend:{r['trend_trades']} MeanRev:{r['mean_rev_trades']}")
-
-    print(f"\n[4/4] Saving...")
+    print(f"\n[5/5] Saving...")
     try:
         sb_url = os.environ.get("SUPABASE_URL")
         sb_key = os.environ.get("SUPABASE_KEY")
         if sb_url and sb_key:
             report_text = (
-                f"BACKTEST v5 — MEAN-REV DOMINANT — 6 Month Test\n\n"
-                f"KEY CHANGE FROM v4:\n"
-                f"  Trend now requires ADX>40 + slope>4% + full EMA stack\n"
-                f"  (v4 trend fired 821 times at PF 0.73 — was destroying capital)\n"
-                f"  Mean-rev is now PRIMARY strategy for ranging/neutral markets\n"
-                f"  Min hold filter: trend positions held 4+ bars before stop\n"
-                f"  Tighter sizing: 0.8% risk per trade, max 4% per position\n"
-                f"  Range confirmation: won't enter mean-rev at start of new trend\n\n"
+                f"BACKTEST v7 — CROSS-SECTIONAL MOMENTUM\n"
+                f"Walk-Forward: 4mo in-sample / 2mo out-of-sample\n\n"
+                f"BEST PARAMS (found in-sample):\n"
+                f"  Lookback: {best_params['lookback']}h | "
+                f"Hold: {best_params['hold_hrs']}h | "
+                f"Top N: {best_params['top_n']} | "
+                f"Skip: {best_params['skip_hrs']}h\n\n"
                 f"RESULTS:\n"
-                f"Total Return:    {total_ret:+.1f}%\n"
-                f"Win Rate:        {combined_wr:.0f}%\n"
-                f"Max Drawdown:    {worst_dd:.1f}%\n"
-                f"Total Trades:    {total_trades} ({total_trend} trend / {total_rev} mean-rev)\n"
-                f"Avg PF:          {avg_pf:.2f}\n"
-                f"Avg Sharpe:      {avg_sharpe:.2f}\n"
-                f"Prop Ready:      {'YES' if prop_ready else 'NOT YET'}\n\n"
-                f"BOT 1: {r1['return_pct']:+.1f}% | WR:{r1['win_rate']:.0f}% | "
-                f"{r1['trades']} trades | DD:{r1['max_dd']:.1f}%\n"
-                f"BOT 2: {r2['return_pct']:+.1f}% | WR:{r2['win_rate']:.0f}% | "
-                f"{r2['trades']} trades | DD:{r2['max_dd']:.1f}%\n"
-                f"BOT 3: {r3['return_pct']:+.1f}% | WR:{r3['win_rate']:.0f}% | "
-                f"{r3['trades']} trades | DD:{r3['max_dd']:.1f}%"
+                f"In-sample (4mo):      {is_ret:+.2f}% | "
+                f"Sharpe: {best_params['sharpe']:.3f}\n"
+                f"Out-of-sample (2mo):  {oos_ret:+.2f}% | "
+                f"Sharpe: {oos_result['sharpe']:.3f}\n"
+                f"Full 6mo ($300K):     {full_result['return_pct']:+.2f}% | "
+                f"DD: {full_result['max_dd']:.2f}%\n\n"
+                f"VERDICT: {verdict}\n"
+                f"Edge real: {edge_real}\n"
+                f"Prop ready: {prop_ready}"
             )
             payload = json.dumps({
                 "week_ending":  datetime.now(timezone.utc).isoformat(),
                 "report_text":  report_text,
                 "bot_data":     summary,
-                "news_context": json.dumps({"type": "backtest_v5"}),
+                "news_context": json.dumps({"type": "backtest_v7"}),
             }).encode()
             req = urllib.request.Request(
                 f"{sb_url}/rest/v1/reports", data=payload,
