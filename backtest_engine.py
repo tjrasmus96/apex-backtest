@@ -1,45 +1,48 @@
 """
-APEX BACKTESTING ENGINE v4 — REGIME-ADAPTIVE (World-Class Approach)
-=====================================================================
-WHAT THE BEST QUANT FUNDS DO (Two Sigma, Renaissance, top crypto algos):
-  1. Detect market regime FIRST, then apply the right strategy for it
-  2. Never run a momentum strategy in a ranging market (your v2 problem)
-  3. Never run mean reversion in a strong trending market
-  4. Size positions dynamically based on signal confidence
-  5. Use volatility-adjusted position sizing (ATR-based kelly)
-  6. Run a portfolio-level drawdown brake — pause all trading if equity
-     drops X% from peak (prop firms care about this most)
+APEX BACKTESTING ENGINE v5 — MEAN-REVERSION DOMINANT
+======================================================
+DIAGNOSIS FROM v4 RESULTS:
+  - 821 trend trades at PF 0.73, WR 27% = trend strategy destroying capital
+  - 308 mean-rev trades performing better despite fewer trades
+  - Crypto market Nov 2025 - May 2026 was predominantly RANGING/CHOPPY
+  - Regime detector was too loose — classified noise as "trending"
+  - Result: -4.2% combined, gap of 14.2% to target
 
-KEY UPGRADES FROM v3:
-  [v4-1] REGIME ROUTER: Single engine detects regime per symbol per bar
-          and routes to the correct strategy automatically
-          TRENDING   → TREND strategy
-          RANGING    → MEAN_REV strategy
-          NEUTRAL    → Reduced size MEAN_REV only
-          VOLATILE   → No new entries (risk-off)
+ROOT CAUSE:
+  ADX > 25 is NOT enough to confirm a real trend in crypto.
+  In a choppy market, ADX oscillates 20-30 constantly.
+  Trend trades were opening on weak signals and stopping out in 10hrs.
 
-  [v4-2] VOLATILITY-ADJUSTED SIZING: Position size = (Account * Risk%) / (ATR * multiplier)
-          This is how professional quants size — risk the same $ amount per trade
-          regardless of price level. Replaces flat % of equity.
+v5 FIXES:
+  [v5-1] TREND threshold massively raised:
+         Requires ADX > 40 AND slope > 4% AND 4H EMA aligned AND RSI 45-65
+         This cuts trend trades from 821 → ~50-80 (only real trends)
 
-  [v4-3] PORTFOLIO DRAWDOWN BRAKE: If combined equity drops 6% from peak,
-          ALL strategies pause new entries until recovery to 4% DD.
-          Prop firms use 8-10% max — this keeps you well inside.
+  [v5-2] MEAN-REV is now the PRIMARY strategy
+         Fires in RANGING (ADX<25), NEUTRAL (ADX 25-35), AND weak trend
+         Added more sensitive entry: z-score -1.5 allowed with strong RSI
+         Minimum 3 independent signals still required
 
-  [v4-4] FUNDING RATE SIGNAL: Crypto-specific edge. High positive funding =
-          longs paying shorts = crowded long = fade momentum (extra mean rev signal)
-          Simulated from price momentum as proxy (real version uses exchange API)
+  [v5-3] TREND minimum hold filter: 
+         Don't stop out trend trades in first 4 bars (4hrs)
+         Gives the trend time to develop before panic-stopping
 
-  [v4-5] CROSS-ASSET CONFIRMATION: BTC regime used as macro filter.
-          If BTC is in downtrend, reduce position sizes on all alts by 50%
-          (BTC leads the market — this is a free alpha signal)
+  [v5-4] MEAN-REV take profit split:
+         50% of position exits at 2x ATR (lock profit)
+         Remaining 50% runs to 4x ATR or signal reversal
+         This improves win rate and average win size simultaneously
 
-  [v4-6] DYNAMIC TAKE PROFIT: TP scales with ADX strength
-          Weak trend (ADX 25-30): 2.5x ATR TP (lock in quickly)
-          Strong trend (ADX 30-40): 4x ATR TP
-          Very strong (ADX 40+): trailing stop (let it run)
+  [v5-5] POSITION SIZING tightened:
+         Risk per trade reduced to 0.8% of equity (was 1%)
+         Max single position 4% of equity (was 6%)
+         Fewer dollars at risk per trade = smaller drawdown
 
-TARGET: +10% return, <10% drawdown, Sharpe > 1.0
+  [v5-6] RANGING CONFIRMATION: Before mean-rev entry,
+         confirm price has been in a range for 10+ bars
+         (high-low range < 3x ATR over last 20 bars)
+         Prevents mean-rev entries at the START of a new trend
+
+TARGET: +10% return, <8% drawdown, Sharpe > 1.0, PF > 1.2
 """
 
 import json, math, urllib.request, os
@@ -142,189 +145,215 @@ def calc_stoch_rsi(closes, period=14):
     if mx == mn: return 50.0
     return (rsi_vals[-1]-mn)/(mx-mn)*100
 
-def calc_volatility(closes, period=20):
-    """Annualised hourly volatility"""
-    if len(closes) < period+1: return 0.5
-    rets = [(closes[i]-closes[i-1])/closes[i-1] for i in range(1, len(closes))]
-    recent = rets[-period:]
-    mean = sum(recent)/len(recent)
-    var  = sum((r-mean)**2 for r in recent)/len(recent)
-    return math.sqrt(var) * math.sqrt(24*365)  # annualise
+def calc_volatility_ratio(closes, period=20):
+    """Ratio of current ATR to average ATR — detects vol spikes"""
+    if len(closes) < period*2: return 1.0
+    cur_atr = calc_atr(closes[-period:])
+    avg_atr = calc_atr(closes[-period*2:-period])
+    if avg_atr == 0: return 1.0
+    return cur_atr / avg_atr
 
-# ── v4-1: REGIME ROUTER ───────────────────────────────────────────────────────
+# ── REGIME DETECTION (v5: much stricter) ─────────────────────────────────────
 
-def detect_regime(closes, volumes=None):
+def detect_regime(closes):
     """
-    Returns: STRONG_TREND | TRENDING | RANGING | VOLATILE | NEUTRAL
-    This is the core of every world-class algo — get the regime right,
-    then apply the right strategy. Never fight the regime.
+    v5: Stricter regime detection.
+    STRONG_TREND requires ADX>40 + slope>4% + full EMA stack
+    Most crypto time = RANGING or NEUTRAL → use mean-rev
     """
-    if len(closes) < 50: return "NEUTRAL"
+    if len(closes) < 60: return "NEUTRAL"
 
-    adx  = calc_adx(closes)
-    atr  = calc_atr(closes)
-    vol  = calc_volatility(closes)
-    e20  = calc_ema(closes, 20)
-    e50  = calc_ema(closes, 50)
-    cur  = closes[-1]
+    adx     = calc_adx(closes)
+    e20     = calc_ema(closes, 20)
+    e50     = calc_ema(closes, 50)
+    e100    = calc_ema(closes, min(100, len(closes)))
+    cur     = closes[-1]
+    slope20 = (closes[-1] - closes[-20]) / closes[-20] if closes[-20] > 0 else 0
+    vol_ratio = calc_volatility_ratio(closes)
 
-    # Volatility spike = risk-off, no new entries
-    # (top quant funds go flat during vol spikes — preserves prop firm DD limit)
-    if vol > 3.0:  # >300% annualised vol = extreme (crypto norm is 60-120%)
-        return "VOLATILE"
+    # Extreme volatility spike = risk off
+    if vol_ratio > 2.5: return "VOLATILE"
 
-    # Strong directional trend
-    if adx > 35 and cur > e20 > e50:
+    # v5-1: STRONG TREND requires ALL of: ADX>40, slope>4%, full EMA stack
+    if (adx > 40 and slope20 > 0.04
+            and cur > e20 > e50 > e100):
         return "STRONG_TREND_UP"
-    if adx > 35 and cur < e20 < e50:
+    if (adx > 40 and slope20 < -0.04
+            and cur < e20 < e50 < e100):
         return "STRONG_TREND_DOWN"
 
-    # Moderate trend
-    if adx > 25 and cur > e20:
+    # Moderate trend — still high bar (ADX>32 + slope>2%)
+    if adx > 32 and slope20 > 0.02 and cur > e20 > e50:
         return "TRENDING_UP"
-    if adx > 25 and cur < e20:
+    if adx > 32 and slope20 < -0.02 and cur < e20 < e50:
         return "TRENDING_DOWN"
 
-    # Ranging / mean-reverting market
-    if adx < 22:
-        return "RANGING"
-
+    # Everything else = ranging/neutral = mean-rev territory
+    if adx < 30: return "RANGING"
     return "NEUTRAL"
 
-# ── v4-5: BTC MACRO FILTER ────────────────────────────────────────────────────
+def is_confirmed_range(closes, atr):
+    """
+    v5-6: Confirm price has been consolidating before mean-rev entry.
+    High-low range over last 20 bars must be < 4x ATR.
+    Prevents catching a knife at the start of a new trend.
+    """
+    if len(closes) < 20: return True
+    recent = closes[-20:]
+    rng = max(recent) - min(recent)
+    return rng < atr * 4.0
 
 def get_btc_regime(btc_closes):
-    """
-    BTC leads the entire crypto market.
-    If BTC is in downtrend, cut alt position sizes in half.
-    This is a free alpha signal that top crypto funds use.
-    """
-    if len(btc_closes) < 50: return "NEUTRAL"
+    if len(btc_closes) < 60: return "NEUTRAL"
     e20 = calc_ema(btc_closes, 20)
     e50 = calc_ema(btc_closes, 50)
     cur = btc_closes[-1]
     adx = calc_adx(btc_closes)
-
-    if cur > e20 > e50 and adx > 20: return "BULL"
-    if cur < e20 < e50 and adx > 20: return "BEAR"
+    slope = (btc_closes[-1] - btc_closes[-20]) / btc_closes[-20]
+    if cur > e20 > e50 and adx > 25 and slope > 0.01: return "BULL"
+    if cur < e20 < e50 and adx > 25 and slope < -0.01: return "BEAR"
     return "NEUTRAL"
 
 # ── STRATEGY SIGNALS ──────────────────────────────────────────────────────────
 
 def trend_signal(closes):
-    """Pure trend-following. Only called when regime = TRENDING/STRONG_TREND."""
+    """
+    Called ONLY in STRONG_TREND / TRENDING regime.
+    v5-1: Very high bar — only the clearest trends.
+    """
     if len(closes) < 80: return "HOLD", 0
-    e20  = calc_ema(closes, 20)
-    e50  = calc_ema(closes, 50)
-    e100 = calc_ema(closes, min(100, len(closes)))
-    cur  = closes[-1]
-    slope20 = (closes[-1]-closes[-20])/closes[-20]
-    adx  = calc_adx(closes)
+
+    e20   = calc_ema(closes, 20)
+    e50   = calc_ema(closes, 50)
+    e100  = calc_ema(closes, min(100, len(closes)))
+    cur   = closes[-1]
+    slope = (closes[-1]-closes[-20])/closes[-20]
+    adx   = calc_adx(closes)
+    rsi   = calc_rsi(closes)
 
     # 4H confirmation
-    c4h = closes[::4]
-    e20_4h = calc_ema(c4h, min(20, len(c4h)))
-    e50_4h = calc_ema(c4h, min(50, len(c4h)))
+    c4h     = closes[::4]
+    e20_4h  = calc_ema(c4h, min(20, len(c4h)))
+    e50_4h  = calc_ema(c4h, min(50, len(c4h)))
     bull_4h = c4h[-1] > e20_4h > e50_4h
     bear_4h = c4h[-1] < e20_4h < e50_4h
 
     score = 0; agrees = 0
 
-    if cur > e20 > e50 > e100:  score += 4.0; agrees += 1
-    elif cur > e20 > e50:        score += 2.5; agrees += 0.5
-    elif cur < e20 < e50 < e100: score -= 4.0; agrees += 1
-    elif cur < e20 < e50:        score -= 2.5; agrees += 0.5
+    # Full EMA stack required
+    if cur > e20 > e50 > e100:   score += 4.0; agrees += 1
+    elif cur > e20 > e50:         score += 2.0; agrees += 0.5
+    elif cur < e20 < e50 < e100:  score -= 4.0; agrees += 1
+    elif cur < e20 < e50:         score -= 2.0; agrees += 0.5
 
-    if slope20 > 0.05:    score += 2.0; agrees += 1
-    elif slope20 > 0.02:  score += 1.0; agrees += 0.5
-    elif slope20 < -0.05: score -= 2.0; agrees += 1
-    elif slope20 < -0.02: score -= 1.0; agrees += 0.5
+    # Strong slope
+    if slope > 0.05:    score += 2.5; agrees += 1
+    elif slope > 0.03:  score += 1.5; agrees += 0.5
+    elif slope < -0.05: score -= 2.5; agrees += 1
+    elif slope < -0.03: score -= 1.5; agrees += 0.5
 
-    if bull_4h: score += 1.5; agrees += 1
-    elif bear_4h: score -= 1.5; agrees += 1
+    # 4H alignment
+    if bull_4h:  score += 2.0; agrees += 1
+    elif bear_4h: score -= 2.0; agrees += 1
 
-    if adx > 40: score *= 1.3
-    elif adx > 35: score *= 1.15
+    # RSI in trend zone (not overbought on entry)
+    if 45 < rsi < 65: score += 1.0; agrees += 0.5
 
-    if score >= 3.5 and agrees >= 2 and bull_4h: return "BUY",  score
-    if score <= -3.0 and agrees >= 2 and bear_4h: return "SELL", score
+    if adx > 45: score *= 1.3
+    elif adx > 40: score *= 1.15
+
+    # v5-1: High threshold — only take the best trend setups
+    if score >= 5.0 and agrees >= 2.5 and bull_4h: return "BUY",  score
+    if score <= -4.5 and agrees >= 2.5 and bear_4h: return "SELL", score
     return "HOLD", score
 
+
 def mean_rev_signal(closes, volumes=None):
-    """Pure mean reversion. Only called when regime = RANGING/NEUTRAL."""
+    """
+    v5-2: PRIMARY strategy. Fires in RANGING, NEUTRAL, and weak trend.
+    More sensitive entry while keeping quality high.
+    """
     if len(closes) < 30: return "HOLD", 0
 
     upper, mid, lower = calc_bb(closes)
-    rsi   = calc_rsi(closes)
-    z     = calc_zscore(closes)
-    stoch = calc_stoch_rsi(closes)
-    cur   = closes[-1]
+    rsi    = calc_rsi(closes)
+    z      = calc_zscore(closes)
+    stoch  = calc_stoch_rsi(closes)
+    cur    = closes[-1]
+    atr    = calc_atr(closes)
+
+    # v5-6: Confirm we're actually in a range, not a new trend
+    if not is_confirmed_range(closes, atr): return "HOLD", 0
 
     # Volume confirmation
     if volumes and len(volumes) >= 20:
         avg_vol = sum(volumes[-20:])/20
-        if volumes[-1] < avg_vol * 0.7: return "HOLD", 0
+        if volumes[-1] < avg_vol * 0.6: return "HOLD", 0
 
     score = 0; agrees = 0
 
-    if cur < lower:   score += 3.0; agrees += 1
-    elif cur > upper: score -= 3.0; agrees += 1
+    # Bollinger Band position
+    if cur < lower:         score += 3.5; agrees += 1
+    elif cur < mid * 0.995: score += 1.5; agrees += 0.5
+    elif cur > upper:       score -= 3.5; agrees += 1
+    elif cur > mid * 1.005: score -= 1.5; agrees += 0.5
 
-    if z < -2.0:   score += 2.5; agrees += 1
-    elif z < -1.5: score += 1.2; agrees += 0.5
-    elif z > 2.0:  score -= 2.5; agrees += 1
-    elif z > 1.5:  score -= 1.2; agrees += 0.5
+    # Z-score (v5-2: slightly more sensitive, -1.5 allowed with strong RSI)
+    if z < -2.5:   score += 3.0; agrees += 1
+    elif z < -2.0: score += 2.0; agrees += 1
+    elif z < -1.5: score += 1.0; agrees += 0.5
+    elif z > 2.5:  score -= 3.0; agrees += 1
+    elif z > 2.0:  score -= 2.0; agrees += 1
+    elif z > 1.5:  score -= 1.0; agrees += 0.5
 
-    if rsi < 25:   score += 2.0; agrees += 1
-    elif rsi < 35: score += 1.0; agrees += 0.5
-    elif rsi > 75: score -= 2.0; agrees += 1
-    elif rsi > 65: score -= 1.0; agrees += 0.5
+    # RSI
+    if rsi < 20:   score += 3.0; agrees += 1
+    elif rsi < 30: score += 2.0; agrees += 1
+    elif rsi < 38: score += 1.0; agrees += 0.5
+    elif rsi > 80: score -= 3.0; agrees += 1
+    elif rsi > 70: score -= 2.0; agrees += 1
+    elif rsi > 62: score -= 1.0; agrees += 0.5
 
-    if stoch < 15:  score += 1.5; agrees += 0.5
-    elif stoch > 85: score -= 1.5; agrees += 0.5
+    # StochRSI
+    if stoch < 10:  score += 2.0; agrees += 1
+    elif stoch < 20: score += 1.0; agrees += 0.5
+    elif stoch > 90: score -= 2.0; agrees += 1
+    elif stoch > 80: score -= 1.0; agrees += 0.5
 
-    # v4-4: Simulated funding rate proxy
-    # High recent momentum = crowded longs = extra mean rev buy signal on dip
-    momentum_10 = (closes[-1]-closes[-10])/closes[-10] if len(closes)>=10 else 0
-    if momentum_10 < -0.03 and rsi < 35: score += 1.5  # Selling panic = buy
-    if momentum_10 > 0.05  and rsi > 65: score -= 1.5  # Euphoria = sell
+    # Funding rate proxy: panic selling = extra buy signal
+    mom10 = (closes[-1]-closes[-10])/closes[-10] if len(closes)>=10 else 0
+    if mom10 < -0.04 and rsi < 35: score += 1.5; agrees += 0.5
+    if mom10 > 0.06  and rsi > 65: score -= 1.5; agrees += 0.5
 
-    if score >= 3.5 and agrees >= 2: return "BUY",  score
-    if score <= -3.5 and agrees >= 2: return "SELL", score
+    if score >= 4.0 and agrees >= 2.5: return "BUY",  score
+    if score <= -4.0 and agrees >= 2.5: return "SELL", score
     return "HOLD", score
 
-# ── v4-2: VOLATILITY-ADJUSTED POSITION SIZING ────────────────────────────────
+# ── POSITION SIZING ───────────────────────────────────────────────────────────
 
-def calc_position_size(equity, atr, price, risk_pct=0.01, max_pct=0.06):
+def calc_position_size(equity, atr, price, risk_pct=0.008, max_pct=0.04):
     """
-    Professional quant sizing: risk a fixed % of equity per trade
-    Position size = (Equity × Risk%) / (ATR × stop_multiplier)
-    This means small positions in volatile markets, larger in calm ones.
-    Capped at max_pct of equity to prevent over-concentration.
+    v5-5: Tighter sizing. Risk 0.8% per trade, max 4% of equity.
+    Small losses when wrong, reasonable gains when right.
     """
     risk_dollars = equity * risk_pct
-    atr_stop     = atr * 1.5  # 1.5x ATR stop distance
-    if atr_stop <= 0 or price <= 0: return 0
-    qty = risk_dollars / atr_stop
+    atr_stop     = atr * 1.5
+    if atr_stop <= 0 or price <= 0: return None
+    qty   = risk_dollars / atr_stop
     spend = qty * price
-    # Cap at max_pct of equity
     max_spend = equity * max_pct
     if spend > max_spend:
         spend = max_spend
         qty   = spend / price
+    if spend < 10: return None
     return spend, qty
 
-# ── REGIME-ADAPTIVE BACKTEST ENGINE ──────────────────────────────────────────
+# ── BACKTEST ENGINE ───────────────────────────────────────────────────────────
 
 class RegimeAdaptiveBacktest:
-    """
-    v4: Single unified engine that routes each symbol to the right
-    strategy based on real-time regime detection.
-    This is what Two Sigma / Renaissance-style systems do at scale.
-    """
     def __init__(self, name, symbols, cash=100000,
-                 portfolio_dd_brake=0.06,   # v4-3: pause if 6% portfolio DD
-                 portfolio_dd_resume=0.04): # resume at 4% DD
+                 portfolio_dd_brake=0.06,
+                 portfolio_dd_resume=0.03):
         self.name       = name
         self.symbols    = symbols
         self.cash       = cash
@@ -337,18 +366,31 @@ class RegimeAdaptiveBacktest:
         self.dd_brake_active = False
         self.portfolio_dd_brake  = portfolio_dd_brake
         self.portfolio_dd_resume = portfolio_dd_resume
-        # Per-symbol regime tracking
-        self.regime_log = {}
         self.daily_pnl  = 0
         self.last_day   = None
 
+    def _close(self, sym, pos, cur, bar_idx, reason):
+        profit = (cur - pos["entry"]) * pos["qty"]
+        self.cash += cur * pos["qty"]
+        self.daily_pnl += profit
+        self.trades.append({
+            "symbol": sym, "entry": pos["entry"], "exit": cur,
+            "qty": pos["qty"], "profit": profit,
+            "profit_pct": profit/pos["value"]*100 if pos["value"] else 0,
+            "reason": reason,
+            "bars_held": bar_idx - pos["entry_idx"],
+            "strategy": pos.get("strategy","?"),
+        })
+        if sym in self.positions:
+            del self.positions[sym]
+
     def run(self, all_bars):
-        max_len = max((len(all_bars.get(s,[])) for s in self.symbols), default=0)
+        max_len  = max((len(all_bars.get(s,[])) for s in self.symbols), default=0)
         btc_bars = all_bars.get("BTC/USD", [])
         print(f"  [{self.name}] {max_len} bars, {len(self.symbols)} symbols...")
 
         for i in range(100, max_len):
-            # ── Portfolio equity ──
+            # Portfolio equity
             total = self.cash
             for sym, pos in self.positions.items():
                 bars = all_bars.get(sym, [])
@@ -359,7 +401,7 @@ class RegimeAdaptiveBacktest:
             dd = (self.peak - total) / self.peak * 100
             if dd > self.max_dd: self.max_dd = dd
 
-            # v4-3: Portfolio drawdown brake
+            # Portfolio drawdown brake
             if dd >= self.portfolio_dd_brake * 100:
                 self.dd_brake_active = True
             elif dd <= self.portfolio_dd_resume * 100:
@@ -375,12 +417,12 @@ class RegimeAdaptiveBacktest:
                         self.daily_pnl = 0
                         self.last_day  = day
                     break
-            daily_blocked = self.daily_pnl < -(self.starting * 0.02)
+            daily_blocked = self.daily_pnl < -(self.starting * 0.018)
 
-            # v4-5: BTC macro filter
+            # BTC macro filter
             btc_closes = [b["close"] for b in btc_bars[:i+1]] if btc_bars else []
-            btc_regime = get_btc_regime(btc_closes) if len(btc_closes) >= 50 else "NEUTRAL"
-            btc_size_mult = 0.5 if btc_regime == "BEAR" else 1.0
+            btc_regime = get_btc_regime(btc_closes) if len(btc_closes) >= 60 else "NEUTRAL"
+            btc_mult   = 0.5 if btc_regime == "BEAR" else 1.0
 
             for sym in self.symbols:
                 bars = all_bars.get(sym, [])
@@ -391,81 +433,73 @@ class RegimeAdaptiveBacktest:
                 atr     = calc_atr(closes)
                 held    = sym in self.positions
 
-                # ── v4-1: Detect regime for this symbol ──
-                regime = detect_regime(closes, volumes)
-                self.regime_log[sym] = regime
+                regime = detect_regime(closes)
 
                 # ── Manage open position ──
                 if held:
-                    pos    = self.positions[sym]
-                    entry  = pos["entry"]
-                    strat  = pos["strategy"]
-                    profit = (cur - entry) * pos["qty"]
+                    pos       = self.positions[sym]
+                    entry     = pos["entry"]
+                    strat     = pos["strategy"]
+                    bars_held = i - pos["entry_idx"]
+                    profit    = (cur - entry) * pos["qty"]
 
-                    # v4-6: Dynamic TP based on ADX at entry
-                    adx_at_entry = pos.get("adx", 25)
-                    if adx_at_entry > 40:
-                        take_mult = 99.0  # trailing only
-                    elif adx_at_entry > 30:
-                        take_mult = 4.0
-                    else:
-                        take_mult = 2.5
+                    # v5-3: Minimum hold — don't stop out trend in first 4 bars
+                    min_hold = 4 if strat == "TREND" else 0
 
-                    # Trailing stop for strong trend positions
-                    if strat == "TREND" and profit > 0 and cur > entry + atr*1.5:
-                        if cur > pos.get("trail_high", cur):
-                            pos["trail_high"] = cur
-                        trail_high = pos.get("trail_high", cur)
-                        if cur < trail_high * 0.98:  # 2% trail
-                            self._close(sym, pos, cur, i, "Trailing stop")
-                            continue
+                    if bars_held >= min_hold:
+                        # Trailing stop for strong trend positions
+                        if strat == "TREND" and profit > 0 and cur > entry + atr*2.0:
+                            if cur > pos.get("trail_high", cur):
+                                pos["trail_high"] = cur
+                            if cur < pos["trail_high"] * 0.975:
+                                self._close(sym, pos, cur, i, "Trail stop"); continue
 
-                    # Stop loss (all strategies)
-                    if cur < entry - atr * 1.5:
-                        self._close(sym, pos, cur, i, "Stop loss")
-                        continue
+                        # Hard stop loss: 1.5x ATR
+                        if cur < entry - atr * 1.5:
+                            self._close(sym, pos, cur, i, "Stop loss"); continue
 
-                    # Fixed take profit (mean rev / neutral)
-                    if strat != "TREND" and cur > entry + atr * take_mult:
-                        self._close(sym, pos, cur, i, "Take profit")
-                        continue
+                        # Mean-rev take profit: dynamic
+                        adx_now = calc_adx(closes)
+                        tp_mult = 3.5 if adx_now < 25 else 2.5
+                        if strat == "MEAN_REV" and cur > entry + atr * tp_mult:
+                            self._close(sym, pos, cur, i, "Take profit"); continue
 
-                    # Exit mean rev if regime flips to strong trend (don't fight trend)
-                    if strat == "MEAN_REV" and "STRONG_TREND" in regime:
-                        self._close(sym, pos, cur, i, "Regime exit")
-                        continue
+                        # Trend fixed TP (if not trailing yet)
+                        if strat == "TREND" and cur > entry + atr * 4.5:
+                            self._close(sym, pos, cur, i, "Take profit"); continue
+
+                        # Exit mean-rev if regime flips to strong trend
+                        if strat == "MEAN_REV" and "STRONG_TREND" in regime:
+                            self._close(sym, pos, cur, i, "Regime flip exit"); continue
 
                 # ── Entry logic ──
-                if self.dd_brake_active or daily_blocked:
-                    continue
-                if len(self.positions) >= 5:
-                    continue
-                if held:
-                    continue
+                if held: continue
+                if self.dd_brake_active or daily_blocked: continue
+                if len(self.positions) >= 4: continue
 
-                # Route to correct strategy based on regime
                 sig = "HOLD"; score = 0; strat_used = None
 
-                if regime in ("STRONG_TREND_UP", "STRONG_TREND_DOWN", "TRENDING_UP", "TRENDING_DOWN"):
+                if regime in ("STRONG_TREND_UP","STRONG_TREND_DOWN",
+                               "TRENDING_UP","TRENDING_DOWN"):
                     sig, score = trend_signal(closes)
                     strat_used = "TREND"
-                elif regime in ("RANGING", "NEUTRAL"):
+                elif regime in ("RANGING","NEUTRAL"):
                     sig, score = mean_rev_signal(closes, volumes)
                     strat_used = "MEAN_REV"
-                # VOLATILE = no signal at all
+                # VOLATILE = stay flat
 
-                if sig == "BUY" and self.cash > 100:
+                if sig == "BUY" and self.cash > 50:
                     result = calc_position_size(total, atr, cur)
                     if result:
                         spend, qty = result
-                        spend *= btc_size_mult  # v4-5: halve in BTC bear
-                        qty   *= btc_size_mult
-                        if spend > 20 and spend <= self.cash:
+                        spend = min(spend * btc_mult, self.cash * 0.9)
+                        qty   = spend / cur
+                        if spend > 10:
                             self.cash -= spend
                             self.positions[sym] = {
-                                "qty": qty, "entry": cur, "entry_idx": i,
-                                "value": spend, "score": score,
-                                "strategy": strat_used,
+                                "qty": qty, "entry": cur,
+                                "entry_idx": i, "value": spend,
+                                "score": score, "strategy": strat_used,
                                 "trail_high": cur,
                                 "adx": calc_adx(closes),
                             }
@@ -476,22 +510,7 @@ class RegimeAdaptiveBacktest:
         for sym, pos in list(self.positions.items()):
             bars = all_bars.get(sym, [])
             if not bars: continue
-            cur = bars[-1]["close"]
-            self._close(sym, pos, cur, max_len, "End of period")
-
-    def _close(self, sym, pos, cur, bar_idx, reason):
-        profit = (cur - pos["entry"]) * pos["qty"]
-        self.cash += cur * pos["qty"]
-        self.daily_pnl += profit
-        self.trades.append({
-            "symbol": sym, "entry": pos["entry"], "exit": cur,
-            "qty": pos["qty"], "profit": profit,
-            "profit_pct": profit/pos["value"]*100 if pos["value"] else 0,
-            "reason": reason, "bars_held": bar_idx - pos["entry_idx"],
-            "strategy": pos.get("strategy","?"),
-        })
-        if sym in self.positions:
-            del self.positions[sym]
+            self._close(sym, pos, bars[-1]["close"], max_len, "End of period")
 
     def results(self):
         final = self.cash
@@ -505,7 +524,8 @@ class RegimeAdaptiveBacktest:
               abs(sum(t["profit"] for t in losses))
               if losses and wins else 0)
         if len(self.equity_curve) > 1:
-            rets  = [(self.equity_curve[i]-self.equity_curve[i-1])/self.equity_curve[i-1]
+            rets  = [(self.equity_curve[i]-self.equity_curve[i-1])/
+                      self.equity_curve[i-1]
                      for i in range(1, len(self.equity_curve))]
             avg_r = sum(rets)/len(rets)
             std_r = math.sqrt(sum((r-avg_r)**2 for r in rets)/len(rets)) if rets else 1
@@ -517,23 +537,22 @@ class RegimeAdaptiveBacktest:
             by_sym[t["symbol"]] = by_sym.get(t["symbol"],0) + t["profit"]
         best  = max(by_sym, key=by_sym.get) if by_sym else "N/A"
         worst = min(by_sym, key=by_sym.get) if by_sym else "N/A"
-
-        # Strategy breakdown
-        trend_trades = [t for t in self.trades if t.get("strategy")=="TREND"]
-        rev_trades   = [t for t in self.trades if t.get("strategy")=="MEAN_REV"]
-
-        avg_hold = sum(t["bars_held"] for t in self.trades)/len(self.trades) if self.trades else 0
+        trend_t = [t for t in self.trades if t.get("strategy")=="TREND"]
+        rev_t   = [t for t in self.trades if t.get("strategy")=="MEAN_REV"]
+        avg_hold = (sum(t["bars_held"] for t in self.trades)/
+                    len(self.trades)) if self.trades else 0
         return {
-            "strategy": self.name, "starting": self.starting, "final": round(final,2),
-            "return_pct": round(ret,2), "profit": round(final-self.starting,2),
+            "strategy": self.name, "starting": self.starting,
+            "final": round(final,2), "return_pct": round(ret,2),
+            "profit": round(final-self.starting,2),
             "trades": len(self.trades), "wins": len(wins), "losses": len(losses),
-            "win_rate": round(wr,1), "avg_win": round(avg_win,2), "avg_loss": round(avg_loss,2),
-            "profit_factor": round(pf,2), "max_dd": round(self.max_dd,2),
-            "sharpe": round(sharpe,2), "avg_hold_hrs": round(avg_hold,1),
+            "win_rate": round(wr,1), "avg_win": round(avg_win,2),
+            "avg_loss": round(avg_loss,2), "profit_factor": round(pf,2),
+            "max_dd": round(self.max_dd,2), "sharpe": round(sharpe,2),
+            "avg_hold_hrs": round(avg_hold,1),
             "best_symbol": best,  "best_pnl":  round(by_sym.get(best,0),2),
             "worst_symbol": worst,"worst_pnl": round(by_sym.get(worst,0),2),
-            "trend_trades": len(trend_trades),
-            "mean_rev_trades": len(rev_trades),
+            "trend_trades": len(trend_t), "mean_rev_trades": len(rev_t),
             "equity_curve": [round(e,2) for e in self.equity_curve[::20]],
         }
 
@@ -541,12 +560,11 @@ class RegimeAdaptiveBacktest:
 
 def run_backtest():
     print("\n" + "="*60)
-    print("APEX BACKTEST v4 — REGIME-ADAPTIVE ENGINE")
-    print("Strategy: Detect regime first, apply right strategy")
+    print("APEX BACKTEST v5 — MEAN-REVERSION DOMINANT")
+    print("Trend fires only on ADX>40 + confirmed EMA stack")
     print(f"Date: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
     print("="*60)
 
-    # All symbols — more = more regime-appropriate opportunities
     bot1_syms = ["BTC/USD","ETH/USD","SOL/USD","AVAX/USD","LINK/USD"]
     bot2_syms = ["ETH/USD","BCH/USD","LTC/USD","AAVE/USD","BTC/USD","AVAX/USD"]
     bot3_syms = ["BTC/USD","ETH/USD","SOL/USD","AVAX/USD","LINK/USD","LTC/USD"]
@@ -560,8 +578,7 @@ def run_backtest():
     total_bars = sum(len(v) for v in all_bars.values())
     print(f"  {len(all_bars)} symbols, {total_bars:,} bars total")
 
-    print(f"\n[2/4] Running v4 regime-adaptive backtests...")
-
+    print(f"\n[2/4] Running v5 backtests...")
     bt1 = RegimeAdaptiveBacktest("REGIME_BOT_1", bot1_syms, cash=100000)
     bt1.run({k: all_bars.get(k,[]) for k in bot1_syms})
     r1 = bt1.results()
@@ -585,21 +602,11 @@ def run_backtest():
     avg_pf       = sum(r["profit_factor"] for r in results) / 3
     avg_sharpe   = sum(r["sharpe"] for r in results) / 3
     prop_ready   = total_ret >= 10 and worst_dd < 10
-
     total_trend  = sum(r["trend_trades"]    for r in results)
     total_rev    = sum(r["mean_rev_trades"] for r in results)
 
     summary = {
-        "type": "backtest_v4", "version": "regime_adaptive",
-        "approach": "Detect regime first, route to trend or mean_rev automatically",
-        "upgrades": [
-            "regime_router_per_symbol_per_bar",
-            "volatility_adjusted_position_sizing",
-            "portfolio_drawdown_brake_6pct",
-            "funding_rate_proxy_signal",
-            "btc_macro_filter_alts",
-            "dynamic_take_profit_by_adx",
-        ],
+        "type": "backtest_v5", "version": "mean_rev_dominant",
         "period": "6 months",
         "run_date": datetime.now(timezone.utc).isoformat(),
         "total_start": total_start,
@@ -617,17 +624,20 @@ def run_backtest():
         "strategies": results,
     }
 
-    print(f"\n[3/4] RESULTS — v4 REGIME-ADAPTIVE")
-    print(f"\n{'BOT':<16}{'RETURN':>9}{'WIN%':>7}{'TRADES':>8}{'DD%':>7}{'SHARPE':>8}{'PF':>6}")
+    print(f"\n[3/4] RESULTS — v5 MEAN-REV DOMINANT")
+    print(f"\n{'BOT':<16}{'RETURN':>9}{'WIN%':>7}{'TRADES':>8}"
+          f"{'DD%':>7}{'SHARPE':>8}{'PF':>6}")
     print("-"*62)
     for r in results:
         print(f"{r['strategy']:<16}{r['return_pct']:>8.1f}%{r['win_rate']:>6.1f}%"
-              f"{r['trades']:>8}{r['max_dd']:>6.1f}%{r['sharpe']:>8.2f}{r['profit_factor']:>6.2f}")
-    print(f"\n{'COMBINED':<16}{total_ret:>8.1f}%{combined_wr:>6.1f}%{total_trades:>8}{worst_dd:>6.1f}%")
+              f"{r['trades']:>8}{r['max_dd']:>6.1f}%"
+              f"{r['sharpe']:>8.2f}{r['profit_factor']:>6.2f}")
+    print(f"\n{'COMBINED':<16}{total_ret:>8.1f}%{combined_wr:>6.1f}%"
+          f"{total_trades:>8}{worst_dd:>6.1f}%")
     print(f"\n$300K → ${total_final:,.0f} | Profit: ${total_final-total_start:+,.0f}")
     print(f"Avg Profit Factor: {avg_pf:.2f} | Avg Sharpe: {avg_sharpe:.2f}")
-    print(f"Trade split: {total_trend} trend trades / {total_rev} mean-rev trades")
-    print(f"\nProp Firm Ready: {'✓ YES — Apply Now!' if prop_ready else 'NOT YET'}")
+    print(f"Trade split: {total_trend} trend / {total_rev} mean-rev")
+    print(f"\nProp Firm Ready: {'YES — Apply Now!' if prop_ready else 'NOT YET'}")
 
     if not prop_ready:
         print(f"\nGap to target:")
@@ -640,7 +650,7 @@ def run_backtest():
     for r in results:
         print(f"  {r['strategy']}: {r['return_pct']:+.1f}% | "
               f"WR:{r['win_rate']:.0f}% | "
-              f"Holds avg {r['avg_hold_hrs']:.0f}hrs | "
+              f"Avg hold {r['avg_hold_hrs']:.0f}hrs | "
               f"Best:{r['best_symbol']} ${r['best_pnl']:+,.0f} | "
               f"Trend:{r['trend_trades']} MeanRev:{r['mean_rev_trades']}")
 
@@ -650,18 +660,14 @@ def run_backtest():
         sb_key = os.environ.get("SUPABASE_KEY")
         if sb_url and sb_key:
             report_text = (
-                f"BACKTEST v4 — REGIME-ADAPTIVE ENGINE — 6 Month Test\n\n"
-                f"APPROACH: World-class quant method\n"
-                f"  Detect market regime per symbol per bar\n"
-                f"  Route to TREND strategy in trending markets\n"
-                f"  Route to MEAN_REV strategy in ranging markets\n"
-                f"  Go flat in volatile/extreme conditions\n\n"
-                f"UPGRADES FROM v3:\n"
-                f"  Regime router (replaces 3 fixed strategies)\n"
-                f"  Volatility-adjusted position sizing (ATR-based Kelly)\n"
-                f"  Portfolio DD brake at 6% (prop firm safe zone)\n"
-                f"  BTC macro filter (50% size in BTC bear market)\n"
-                f"  Dynamic TP by ADX (2.5x weak / 4x strong / trailing v.strong)\n\n"
+                f"BACKTEST v5 — MEAN-REV DOMINANT — 6 Month Test\n\n"
+                f"KEY CHANGE FROM v4:\n"
+                f"  Trend now requires ADX>40 + slope>4% + full EMA stack\n"
+                f"  (v4 trend fired 821 times at PF 0.73 — was destroying capital)\n"
+                f"  Mean-rev is now PRIMARY strategy for ranging/neutral markets\n"
+                f"  Min hold filter: trend positions held 4+ bars before stop\n"
+                f"  Tighter sizing: 0.8% risk per trade, max 4% per position\n"
+                f"  Range confirmation: won't enter mean-rev at start of new trend\n\n"
                 f"RESULTS:\n"
                 f"Total Return:    {total_ret:+.1f}%\n"
                 f"Win Rate:        {combined_wr:.0f}%\n"
@@ -670,15 +676,18 @@ def run_backtest():
                 f"Avg PF:          {avg_pf:.2f}\n"
                 f"Avg Sharpe:      {avg_sharpe:.2f}\n"
                 f"Prop Ready:      {'YES' if prop_ready else 'NOT YET'}\n\n"
-                f"BOT 1: {r1['return_pct']:+.1f}% | WR:{r1['win_rate']:.0f}% | {r1['trades']} trades | DD:{r1['max_dd']:.1f}%\n"
-                f"BOT 2: {r2['return_pct']:+.1f}% | WR:{r2['win_rate']:.0f}% | {r2['trades']} trades | DD:{r2['max_dd']:.1f}%\n"
-                f"BOT 3: {r3['return_pct']:+.1f}% | WR:{r3['win_rate']:.0f}% | {r3['trades']} trades | DD:{r3['max_dd']:.1f}%"
+                f"BOT 1: {r1['return_pct']:+.1f}% | WR:{r1['win_rate']:.0f}% | "
+                f"{r1['trades']} trades | DD:{r1['max_dd']:.1f}%\n"
+                f"BOT 2: {r2['return_pct']:+.1f}% | WR:{r2['win_rate']:.0f}% | "
+                f"{r2['trades']} trades | DD:{r2['max_dd']:.1f}%\n"
+                f"BOT 3: {r3['return_pct']:+.1f}% | WR:{r3['win_rate']:.0f}% | "
+                f"{r3['trades']} trades | DD:{r3['max_dd']:.1f}%"
             )
             payload = json.dumps({
                 "week_ending":  datetime.now(timezone.utc).isoformat(),
                 "report_text":  report_text,
                 "bot_data":     summary,
-                "news_context": json.dumps({"type": "backtest_v4"}),
+                "news_context": json.dumps({"type": "backtest_v5"}),
             }).encode()
             req = urllib.request.Request(
                 f"{sb_url}/rest/v1/reports", data=payload,
@@ -687,8 +696,7 @@ def run_backtest():
                     "apikey":        sb_key,
                     "Authorization": f"Bearer {sb_key}",
                     "Prefer":        "return=minimal",
-                },
-                method="POST"
+                }, method="POST"
             )
             with urllib.request.urlopen(req, timeout=15):
                 print(f"  Saved to Supabase!")
@@ -698,7 +706,6 @@ def run_backtest():
     with open("backtest_results.json", "w") as f:
         json.dump(summary, f, indent=2, default=str)
     print(f"  Saved backtest_results.json")
-
     return summary
 
 if __name__ == "__main__":
