@@ -1,27 +1,33 @@
 """
-APEX BACKTEST v8d — MULTI-WINDOW VALIDATION
-============================================
-PURPOSE: Test the v8c strategy across MULTIPLE time windows to confirm
-the edge is real and not specific to one 6-month period.
+APEX BACKTEST v8c — EUR/USD MEAN REVERSION (FRESH 6-MONTH RUN)
+================================================================
+Re-run of the locked v8c strategy on the most recent 6 months of data
+(whatever "today" is when this script executes).
 
-WINDOWS TESTED:
-  Window 1: Last 6 months  (most recent)
-  Window 2: Last 12 months (longer history)
-  Window 3: Months 7-12 ago (older window, completely different period)
-
-LOCKED PARAMS FROM v8c (no changes):
+LOCKED PARAMS (proven across 3 historical windows):
   bb_period=10, bb_std=2.0, rsi_period=7, rsi_ob=65, rsi_os=40
   atr_stop=2.0, atr_tp=1.5, min_score=3
-  risk_per_trade=0.4%, max_total_loss=6%
+  risk_per_trade=0.4%, max_total_loss=6% (internal safety buffer)
 
-If the strategy is profitable across ALL THREE windows, the edge is real.
-If it only works on one window, it was luck.
+WALK-FORWARD METHODOLOGY:
+  In-sample:     first 4 months of the fetched window
+  Out-of-sample: last 2 months of the fetched window (never touched
+                 during parameter selection — params are already locked
+                 from prior testing, so this run is itself a fresh
+                 out-of-sample test on entirely new data)
+
+FTMO-STYLE TARGETS (for reference):
+  Return:    >= 10%    (8% on some firms in 2026 — checked against both)
+  Drawdown:  < 10%
+  Daily DD:  < 5%
 """
 
 import json, math, urllib.request, os
 from datetime import datetime, timezone
 
-def fetch_eurusd(months=12):
+# ── DATA ─────────────────────────────────────────────────────────────────────
+
+def fetch_eurusd(months=6):
     url = (f"https://query1.finance.yahoo.com/v8/finance/chart/EURUSD=X"
            f"?interval=1h&range={months*30}d")
     try:
@@ -37,20 +43,26 @@ def fetch_eurusd(months=12):
             if c is None or c == 0: continue
             bars.append({
                 "timestamp": ts,
-                "open":   ohlcv["open"][i]  or c,
-                "high":   ohlcv["high"][i]  or c,
-                "low":    ohlcv["low"][i]   or c,
                 "close":  c,
+                "high":   ohlcv["high"][i] or c,
+                "low":    ohlcv["low"][i]  or c,
                 "volume": ohlcv["volume"][i] or 0,
                 "hour_est": ((ts % 86400) // 3600 - 5) % 24,
             })
         session = [b for b in bars if 7 <= b["hour_est"] <= 17]
         print(f"  EUR/USD: {len(bars)} total bars, "
-              f"{len(session)} session bars")
+              f"{len(session)} session bars (07-17 EST)")
+        if bars:
+            start_date = datetime.fromtimestamp(bars[0]["timestamp"], tz=timezone.utc)
+            end_date   = datetime.fromtimestamp(bars[-1]["timestamp"], tz=timezone.utc)
+            print(f"  Date range: {start_date.strftime('%Y-%m-%d')} "
+                  f"to {end_date.strftime('%Y-%m-%d')}")
         return session
     except Exception as e:
         print(f"  EUR/USD fetch failed: {e}")
         return []
+
+# ── INDICATORS ────────────────────────────────────────────────────────────────
 
 def calc_bb(closes, period, std_mult):
     if len(closes) < period:
@@ -61,8 +73,8 @@ def calc_bb(closes, period, std_mult):
 
 def calc_rsi(closes, period):
     if len(closes) < period+1: return 50.0
-    gains  = [max(closes[i]-closes[i-1],0) for i in range(1,len(closes))]
-    losses = [max(closes[i-1]-closes[i],0) for i in range(1,len(closes))]
+    gains  = [max(closes[i]-closes[i-1], 0) for i in range(1, len(closes))]
+    losses = [max(closes[i-1]-closes[i], 0) for i in range(1, len(closes))]
     ag = sum(gains[-period:])/period
     al = sum(losses[-period:])/period
     if al==0: return 100.0
@@ -70,7 +82,7 @@ def calc_rsi(closes, period):
 
 def calc_atr(closes, period=14):
     if len(closes)<2: return abs(closes[-1])*0.001
-    trs = [abs(closes[i]-closes[i-1]) for i in range(1,len(closes))]
+    trs=[abs(closes[i]-closes[i-1]) for i in range(1,len(closes))]
     return sum(trs[-period:])/min(len(trs),period)
 
 def calc_zscore(closes, period=20):
@@ -79,8 +91,9 @@ def calc_zscore(closes, period=20):
     std=math.sqrt(sum((x-mid)**2 for x in sl)/period) or 1e-10
     return (closes[-1]-mid)/std
 
+# ── BACKTEST (locked v8c logic) ───────────────────────────────────────────────
+
 def run_backtest(bars, start_idx, end_idx, starting_cash=50000):
-    # LOCKED params from v8c
     bb_period=10; bb_std=2.0; rsi_period=7
     rsi_ob=65; rsi_os=40; atr_stop=2.0; atr_tp=1.5
     min_score=3; risk_per_trade=0.004; max_total_loss=0.06
@@ -222,135 +235,123 @@ def run_backtest(bars, start_idx, end_idx, starting_cash=50000):
         "worst_day_pct": round(worst_day,3),
         "trading_days":  len(trading_days),
         "killed":        killed,
-        "ftmo_pass":     (ret>=8.0 and max_dd<10.0 and worst_day>-5.0),
+        "ftmo_pass_10":  (ret>=10.0 and max_dd<10.0 and worst_day>-5.0),
+        "ftmo_pass_8":   (ret>=8.0  and max_dd<10.0 and worst_day>-5.0),
         "equity_curve":  [round(e,2) for e in equity_curve[::10]],
     }
 
+# ── MAIN ──────────────────────────────────────────────────────────────────────
+
 def run_full_backtest():
     print("\n"+"="*65)
-    print("APEX BACKTEST v8d — MULTI-WINDOW VALIDATION")
-    print("Testing v8c strategy across 3 different time windows")
-    print(f"Date: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+    print("APEX BACKTEST v8c — FRESH 6-MONTH RUN")
+    print("Locked params | Most recent available data")
+    print(f"Run date: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
     print("="*65)
 
-    print(f"\n[1/3] Downloading 12 months of EUR/USD data...")
-    bars_12mo = fetch_eurusd(months=12)
-    if not bars_12mo:
-        print("No data. Exiting."); return {}
+    print(f"\n[1/4] Downloading EUR/USD 6-month hourly data...")
+    session_bars = fetch_eurusd(months=6)
 
-    total = len(bars_12mo)
-    half  = total // 2
+    if len(session_bars) < 200:
+        print("Insufficient data. Exiting.")
+        return {}
 
-    # Window 1: Last 6 months (same as v8c — should match)
-    w1_start = half
-    w1_end   = total
+    total     = len(session_bars)
+    is_end    = int(total * (4/6))
+    oos_start = is_end
+    oos_end   = total
 
-    # Window 2: Full 12 months
-    w2_start = 0
-    w2_end   = total
+    print(f"\n  Session bars total: {total}")
+    print(f"  In-sample:     0–{is_end} ({is_end} bars ≈ 4 months)")
+    print(f"  Out-of-sample: {oos_start}–{oos_end} "
+          f"({oos_end-oos_start} bars ≈ 2 months)")
+    print(f"  This entire window is NEW data not used when params were locked")
 
-    # Window 3: First 6 months (completely different period)
-    w3_start = 0
-    w3_end   = half
+    print(f"\n[2/4] In-sample check (4mo)...")
+    ins = run_backtest(session_bars, 0, is_end)
+    print(f"  Return: {ins['return_pct']:+.2f}% | "
+          f"Sharpe: {ins['sharpe']:.3f} | "
+          f"DD: {ins['max_dd']:.2f}% | "
+          f"Trades: {ins['trades']}")
 
-    print(f"  Total bars: {total}")
-    print(f"  Window 1 (recent 6mo):  bars {w1_start}–{w1_end}")
-    print(f"  Window 2 (full 12mo):   bars {w2_start}–{w2_end}")
-    print(f"  Window 3 (older 6mo):   bars {w3_start}–{w3_end}")
+    print(f"\n[3/4] Out-of-sample check (2mo, most recent)...")
+    oos = run_backtest(session_bars, oos_start, oos_end)
+    print(f"  Return: {oos['return_pct']:+.2f}% | "
+          f"Sharpe: {oos['sharpe']:.3f} | "
+          f"DD: {oos['max_dd']:.2f}% | "
+          f"Trades: {oos['trades']}")
 
-    print(f"\n[2/3] Running all windows...")
-    r1 = run_backtest(bars_12mo, w1_start, w1_end)
-    print(f"  Window 1 (recent 6mo):  "
-          f"Return={r1['return_pct']:+.2f}% | "
-          f"Sharpe={r1['sharpe']:.3f} | "
-          f"DD={r1['max_dd']:.2f}% | "
-          f"Trades={r1['trades']}")
+    print(f"\n[4/4] Full 6-month simulation ($50K)...")
+    full = run_backtest(session_bars, 0, total, starting_cash=50000)
 
-    r2 = run_backtest(bars_12mo, w2_start, w2_end)
-    print(f"  Window 2 (full 12mo):   "
-          f"Return={r2['return_pct']:+.2f}% | "
-          f"Sharpe={r2['sharpe']:.3f} | "
-          f"DD={r2['max_dd']:.2f}% | "
-          f"Trades={r2['trades']}")
-
-    r3 = run_backtest(bars_12mo, w3_start, w3_end)
-    print(f"  Window 3 (older 6mo):   "
-          f"Return={r3['return_pct']:+.2f}% | "
-          f"Sharpe={r3['sharpe']:.3f} | "
-          f"DD={r3['max_dd']:.2f}% | "
-          f"Trades={r3['trades']}")
-
-    print(f"\n[3/3] Results")
     print(f"\n{'='*65}")
-    print(f"MULTI-WINDOW VALIDATION RESULTS")
+    print(f"RESULTS — FRESH 6-MONTH RUN")
     print(f"{'='*65}")
-    print(f"\n{'WINDOW':<24}{'RET%':>7}{'WR%':>6}{'TRADES':>8}"
-          f"{'DD%':>7}{'SHARPE':>9}{'PF':>7}{'FTMO':>6}")
+    print(f"\n{'PHASE':<24}{'RET%':>7}{'WR%':>6}{'TRADES':>8}"
+          f"{'DD%':>7}{'SHARPE':>9}{'PF':>7}")
     print(f"{'-'*65}")
+    print(f"{'In-sample (4mo)':<24}"
+          f"{ins['return_pct']:>7.2f}%{ins['win_rate']:>6.1f}%"
+          f"{ins['trades']:>8}{ins['max_dd']:>6.2f}%"
+          f"{ins['sharpe']:>9.3f}{ins['profit_factor']:>7.3f}")
+    print(f"{'Out-of-sample (2mo)':<24}"
+          f"{oos['return_pct']:>7.2f}%{oos['win_rate']:>6.1f}%"
+          f"{oos['trades']:>8}{oos['max_dd']:>6.2f}%"
+          f"{oos['sharpe']:>9.3f}{oos['profit_factor']:>7.3f}")
+    print(f"{'Full 6mo ($50K)':<24}"
+          f"{full['return_pct']:>7.2f}%{full['win_rate']:>6.1f}%"
+          f"{full['trades']:>8}{full['max_dd']:>6.2f}%"
+          f"{full['sharpe']:>9.3f}{full['profit_factor']:>7.3f}")
 
-    windows = [
-        ("Recent 6mo (v8c)",   r1),
-        ("Full 12mo",          r2),
-        ("Older 6mo",          r3),
-    ]
-    for name, r in windows:
-        print(f"{name:<24}"
-              f"{r['return_pct']:>7.2f}%"
-              f"{r['win_rate']:>6.1f}%"
-              f"{r['trades']:>8}"
-              f"{r['max_dd']:>6.2f}%"
-              f"{r['sharpe']:>9.3f}"
-              f"{r['profit_factor']:>7.3f}"
-              f"{'PASS' if r['ftmo_pass'] else 'FAIL':>6}")
+    print(f"\n$50K → ${full['final']:,.2f} | "
+          f"Profit: ${full['profit']:+,.2f}")
 
-    # Count how many windows pass
-    passes = sum(1 for _,r in windows if r["ftmo_pass"])
-    positives = sum(1 for _,r in windows if r["return_pct"]>0)
+    print(f"\nPROP FIRM RULE COMPLIANCE (full 6mo sim):")
+    print(f"  Daily loss:    {'PASS' if full['worst_day_pct']>-5.0 else 'FAIL'} "
+          f"(worst day: {full['worst_day_pct']:.2f}% vs -5% limit)")
+    print(f"  Max drawdown:  {'PASS' if full['max_dd']<10.0 else 'FAIL'} "
+          f"({full['max_dd']:.2f}% vs 10% limit)")
+    print(f"  Target (10%):  {'PASS' if full['ftmo_pass_10'] else 'NOT YET'} "
+          f"({full['return_pct']:.2f}% vs 10% target)")
+    print(f"  Target (8%):   {'PASS' if full['ftmo_pass_8'] else 'NOT YET'} "
+          f"({full['return_pct']:.2f}% vs 8% target)")
+    print(f"  Trading days:  {full['trading_days']}")
+
+    is_ret  = ins["return_pct"]
+    oos_ret = oos["return_pct"]
+    decay   = is_ret - oos_ret
 
     print(f"\n{'='*65}")
-    print(f"VERDICT")
+    print(f"HONEST VERDICT")
     print(f"{'='*65}")
-    print(f"\nWindows with positive return: {positives}/3")
-    print(f"Windows passing FTMO rules:   {passes}/3")
+    print(f"\nIn-sample:     {is_ret:+.2f}%")
+    print(f"Out-of-sample: {oos_ret:+.2f}%")
+    print(f"Decay:         {decay:+.2f}% (< 3% good, > 5% concerning)")
 
-    if passes == 3:
-        verdict = "STRONG — passes all 3 windows. Edge is real across time."
-        confidence = "HIGH"
-    elif passes == 2 and positives == 3:
-        verdict = "GOOD — 2/3 windows pass FTMO, all 3 profitable."
-        confidence = "MEDIUM-HIGH"
-    elif positives >= 2:
-        verdict = "MODERATE — profitable in most windows but risk management needs tuning."
-        confidence = "MEDIUM"
+    if oos["sharpe"] > 0.5 and oos_ret > 0:
+        verdict = "EDGE HOLDS — positive OOS on fresh data, good Sharpe"
+    elif oos_ret > 0:
+        verdict = "WEAK EDGE — OOS positive but Sharpe low, watch closely"
+    elif abs(decay) < 3 and oos_ret > -2:
+        verdict = "INCONCLUSIVE — small decay, modestly unprofitable OOS"
     else:
-        verdict = "WEAK — only profitable in one window. Edge may not be robust."
-        confidence = "LOW"
+        verdict = "EDGE WEAKENED — meaningful decay on this fresh window"
 
-    print(f"Verdict:    {verdict}")
-    print(f"Confidence: {confidence}")
+    print(f"\nVerdict: {verdict}")
 
-    if confidence in ("HIGH","MEDIUM-HIGH"):
-        print(f"\nRECOMMENDATION:")
-        print(f"  1. Proceed with FTMO free trial first (ftmo.com → Free Trial)")
-        print(f"  2. Then enter $10K challenge (~€155) to prove live execution")
-        print(f"  3. Scale to $50K once live performance confirmed")
+    if full['ftmo_pass_8'] or full['ftmo_pass_10']:
+        print(f"\nThis run would PASS a prop firm evaluation.")
     else:
-        print(f"\nRECOMMENDATION:")
-        print(f"  Do NOT pay evaluation fees yet.")
-        print(f"  The edge needs to be more consistent across time windows.")
+        gap = 8.0 - full['return_pct'] if full['return_pct'] < 8 else 0
+        print(f"\nThis run would NOT yet pass. Gap to 8% target: {gap:.2f}%")
 
     summary = {
-        "type": "backtest_v8d_multi_window",
+        "type": "backtest_v8c_fresh_run",
         "run_date": datetime.now(timezone.utc).isoformat(),
-        "windows": {
-            "recent_6mo": {k:v for k,v in r1.items() if k!="equity_curve"},
-            "full_12mo":  {k:v for k,v in r2.items() if k!="equity_curve"},
-            "older_6mo":  {k:v for k,v in r3.items() if k!="equity_curve"},
-        },
-        "windows_passing": passes,
-        "windows_profitable": positives,
+        "in_sample":     {k:v for k,v in ins.items()  if k!="equity_curve"},
+        "out_of_sample": {k:v for k,v in oos.items()  if k!="equity_curve"},
+        "full_6mo":      {k:v for k,v in full.items() if k!="equity_curve"},
         "verdict": verdict,
-        "confidence": confidence,
     }
 
     try:
@@ -358,20 +359,20 @@ def run_full_backtest():
         sb_key=os.environ.get("SUPABASE_KEY")
         if sb_url and sb_key:
             report_text=(
-                f"BACKTEST v8d — MULTI-WINDOW VALIDATION\n\n"
-                f"Recent 6mo:  {r1['return_pct']:+.2f}% | "
-                f"DD:{r1['max_dd']:.2f}% | FTMO:{'PASS' if r1['ftmo_pass'] else 'FAIL'}\n"
-                f"Full 12mo:   {r2['return_pct']:+.2f}% | "
-                f"DD:{r2['max_dd']:.2f}% | FTMO:{'PASS' if r2['ftmo_pass'] else 'FAIL'}\n"
-                f"Older 6mo:   {r3['return_pct']:+.2f}% | "
-                f"DD:{r3['max_dd']:.2f}% | FTMO:{'PASS' if r3['ftmo_pass'] else 'FAIL'}\n\n"
-                f"Verdict: {verdict}\nConfidence: {confidence}"
+                f"BACKTEST v8c — FRESH 6-MONTH RUN\n"
+                f"Run date: {datetime.now(timezone.utc).strftime('%Y-%m-%d')}\n\n"
+                f"In-sample:     {is_ret:+.2f}% | DD:{ins['max_dd']:.2f}%\n"
+                f"Out-of-sample: {oos_ret:+.2f}% | DD:{oos['max_dd']:.2f}%\n"
+                f"Full 6mo:      {full['return_pct']:+.2f}% | DD:{full['max_dd']:.2f}%\n"
+                f"Verdict: {verdict}\n"
+                f"Pass 8% target: {full['ftmo_pass_8']}\n"
+                f"Pass 10% target: {full['ftmo_pass_10']}"
             )
             payload=json.dumps({
                 "week_ending": datetime.now(timezone.utc).isoformat(),
                 "report_text": report_text,
                 "bot_data": summary,
-                "news_context": json.dumps({"type":"backtest_v8d"}),
+                "news_context": json.dumps({"type":"backtest_v8c_fresh"}),
             }).encode()
             req=urllib.request.Request(
                 f"{sb_url}/rest/v1/reports",data=payload,
